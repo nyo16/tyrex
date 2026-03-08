@@ -43,7 +43,7 @@ defmodule Tyrex.MixProject do
         "priv/main.js",
         "README.md"
       ],
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => @source_url
       },

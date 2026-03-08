@@ -373,4 +373,4 @@ Tyrex is inspired by [deno_rider](https://github.com/aglundahl/deno_rider), whic
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE) for details.
