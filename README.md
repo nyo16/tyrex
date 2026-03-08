@@ -57,6 +57,36 @@ export TYREX_BUILD=true
 Tyrex.stop(pid: pid)
 ```
 
+### Inline `~JS` Sigil
+
+For a more ergonomic experience, use the `~JS` sigil with a process-local runtime:
+
+```elixir
+import Tyrex.Sigil
+
+{:ok, pid} = Tyrex.start()
+Tyrex.Inline.set_runtime(pid)
+
+# Raw JavaScript — no Elixir interpolation (safe for template literals)
+{:ok, 3} = ~JS"1 + 2"
+{:ok, "Value: 42"} = ~JS"`Value: ${40 + 2}`"
+
+# Multi-line
+{:ok, [2, 4, 6]} = ~JS"""
+const arr = [1, 2, 3];
+arr.map(n => n * 2)
+"""
+
+# For passing Elixir values, use Tyrex.Inline.eval with standard interpolation
+x = 10
+{:ok, 15} = Tyrex.Inline.eval("#{x} + 5")
+
+# Scoped runtime binding
+Tyrex.Inline.with_runtime(pid, fn ->
+  {:ok, 42} = ~JS"21 * 2"
+end)
+```
+
 ### Named Runtime (for supervision trees)
 
 ```elixir

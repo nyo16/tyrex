@@ -60,7 +60,8 @@ defmodule Tyrex.MixProject do
       ],
       source_ref: "v#{@version}",
       groups_for_modules: [
-        Core: [Tyrex, Tyrex.Error, Tyrex.Runtime, Tyrex.Native],
+        Core: [Tyrex, Tyrex.Error, Tyrex.Runtime],
+        "Inline JS": [Tyrex.Sigil, Tyrex.Inline],
         Pool: [Tyrex.Pool, Tyrex.Pool.Strategy],
         Strategies: [
           Tyrex.Pool.Strategy.RoundRobin,
