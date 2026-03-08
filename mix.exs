@@ -38,7 +38,11 @@ defmodule Tyrex.MixProject do
         "checksum-Elixir.Tyrex.Native.exs",
         "LICENSE",
         "lib",
-        "native",
+        "native/tyrex/Cargo.toml",
+        "native/tyrex/Cargo.lock",
+        "native/tyrex/Cross.toml",
+        "native/tyrex/src",
+        "native/tyrex/extension",
         "mix.exs",
         "priv/main.js",
         "README.md"
