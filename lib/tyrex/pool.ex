@@ -1,4 +1,29 @@
 defmodule Tyrex.Pool do
+  @moduledoc """
+  A pool of Deno runtimes with pluggable dispatch strategies.
+
+  `Tyrex.Pool` is a `Supervisor` that starts multiple `Tyrex` GenServer children
+  and distributes `eval` calls across them using a configurable strategy.
+
+  ## Usage
+
+      # In your supervision tree
+      children = [
+        {Tyrex.Pool, name: :js_pool, size: 4}
+      ]
+
+      # Evaluate code on a pool-selected runtime
+      {:ok, result} = Tyrex.Pool.eval(:js_pool, "1 + 2")
+
+  ## Strategies
+
+    * `Tyrex.Pool.Strategy.RoundRobin` (default) — cycles through runtimes sequentially
+    * `Tyrex.Pool.Strategy.Random` — picks a random runtime
+    * `Tyrex.Pool.Strategy.Hash` — routes by `:key` option for sticky sessions
+
+  See `Tyrex.Pool.Strategy` for implementing custom strategies.
+  """
+
   use Supervisor
 
   @doc """

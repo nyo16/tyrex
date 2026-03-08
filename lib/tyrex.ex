@@ -1,4 +1,33 @@
 defmodule Tyrex do
+  @moduledoc """
+  Embedded Deno JS/TS runtime for Elixir.
+
+  Tyrex wraps the Deno runtime as a GenServer, allowing you to evaluate JavaScript
+  and TypeScript code directly from Elixir. Each runtime is an isolated V8 instance
+  with full access to Deno APIs.
+
+  ## Quick Start
+
+      {:ok, pid} = Tyrex.start()
+      {:ok, 3} = Tyrex.eval("1 + 2", pid: pid)
+      Tyrex.stop(pid: pid)
+
+  ## Named Runtime
+
+      # In your supervision tree
+      {Tyrex, name: MyApp.JS, main_module_path: "priv/js/app.js"}
+
+      # Then anywhere
+      {:ok, result} = Tyrex.eval("processData()", name: MyApp.JS)
+
+  ## Calling Elixir from JavaScript
+
+  JavaScript code can call Elixir functions via `Tyrex.apply()`:
+
+      Tyrex.eval(~s|(async () => await Tyrex.apply("Enum", "sum", [[1,2,3]]))()|, pid: pid)
+      # => {:ok, 6}
+  """
+
   use GenServer
 
   alias Tyrex.Error

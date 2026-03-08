@@ -1,4 +1,13 @@
 defmodule Tyrex.Error do
+  @moduledoc """
+  Exception struct for Tyrex runtime errors.
+
+  Fields:
+    * `:name` - Error type atom (e.g., `:execution_error`, `:promise_rejection`, `:dead_runtime_error`)
+    * `:message` - Human-readable error message (optional)
+    * `:value` - Additional error value, such as the rejected promise value (optional)
+  """
+
   @enforce_keys [
     :name
   ]

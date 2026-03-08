@@ -1,8 +1,10 @@
 defmodule Tyrex.Native do
+  @moduledoc false
+
   version = Mix.Project.config()[:version]
 
   use RustlerPrecompiled,
-    base_url: "https://github.com/example/tyrex/releases/download/v#{version}",
+    base_url: "https://github.com/nyo16/tyrex/releases/download/v#{version}",
     crate: "tyrex",
     force_build: System.get_env("TYREX_BUILD") == "true",
     nif_versions: ["2.15"],

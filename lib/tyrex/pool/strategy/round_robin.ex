@@ -1,4 +1,10 @@
 defmodule Tyrex.Pool.Strategy.RoundRobin do
+  @moduledoc """
+  Round-robin dispatch strategy (default).
+
+  Uses an ETS atomic counter for lock-free, sequential cycling through runtimes.
+  """
+
   @behaviour Tyrex.Pool.Strategy
 
   @impl true
