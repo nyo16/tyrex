@@ -10,7 +10,12 @@ use rustler::Env;
 use rustler::ResourceArc;
 
 #[rustler::nif]
-fn start_runtime(env: Env, pid: rustler::LocalPid, main_module_path: String) -> rustler::Atom {
+fn start_runtime(
+    env: Env,
+    pid: rustler::LocalPid,
+    main_module_path: String,
+    permissions_json: String,
+) -> rustler::Atom {
     let task_pid = env.pid();
     let runtime_id = runtimes::get().lock().unwrap().insert(pid);
     let (worker_sender, worker_receiver) =
@@ -21,7 +26,7 @@ fn start_runtime(env: Env, pid: rustler::LocalPid, main_module_path: String) -> 
             .build()
             .unwrap()
             .block_on(async {
-                match worker::new(runtime_id, main_module_path).await {
+                match worker::new(runtime_id, main_module_path, permissions_json).await {
                     Ok(worker) => {
                         util::send_to_pid(
                             &task_pid,

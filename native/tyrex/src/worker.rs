@@ -37,9 +37,81 @@ deno_core::extension!(
     esm = [dir "extension", "main.js"]
 );
 
-pub async fn new(runtime_id: usize, main_module_path: String) -> Result<MainWorker, Error> {
+fn parse_string_list(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::Bool(true) => Some(vec![]),
+        serde_json::Value::Bool(false) => None,
+        serde_json::Value::Array(arr) => {
+            Some(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        }
+        _ => None,
+    }
+}
+
+fn build_permissions(
+    permissions_json: &str,
+) -> deno_runtime::deno_permissions::PermissionsContainer {
+    let descriptor_parser = std::sync::Arc::new(
+        deno_runtime::permissions::RuntimePermissionDescriptorParser::new(
+            sys_traits::impls::RealSys,
+        ),
+    );
+
+    let parsed: serde_json::Value = match serde_json::from_str(permissions_json) {
+        Ok(v) => v,
+        Err(_) => {
+            return deno_runtime::deno_permissions::PermissionsContainer::allow_all(
+                descriptor_parser,
+            );
+        }
+    };
+
+    if parsed.is_string() && parsed.as_str() == Some("allow_all") {
+        return deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser);
+    }
+
+    if !parsed.is_object() {
+        return deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser);
+    }
+
+    let obj = parsed.as_object().unwrap();
+    let opts = deno_runtime::deno_permissions::PermissionsOptions {
+        allow_all: obj.get("allow_all").and_then(|v| v.as_bool()).unwrap_or(false),
+        allow_env: obj.get("allow_env").and_then(parse_string_list),
+        deny_env: obj.get("deny_env").and_then(parse_string_list),
+        allow_net: obj.get("allow_net").and_then(parse_string_list),
+        deny_net: obj.get("deny_net").and_then(parse_string_list),
+        allow_ffi: obj.get("allow_ffi").and_then(parse_string_list),
+        deny_ffi: obj.get("deny_ffi").and_then(parse_string_list),
+        allow_read: obj.get("allow_read").and_then(parse_string_list),
+        deny_read: obj.get("deny_read").and_then(parse_string_list),
+        allow_run: obj.get("allow_run").and_then(parse_string_list),
+        deny_run: obj.get("deny_run").and_then(parse_string_list),
+        allow_sys: obj.get("allow_sys").and_then(parse_string_list),
+        deny_sys: obj.get("deny_sys").and_then(parse_string_list),
+        allow_write: obj.get("allow_write").and_then(parse_string_list),
+        deny_write: obj.get("deny_write").and_then(parse_string_list),
+        allow_import: obj.get("allow_import").and_then(parse_string_list),
+        prompt: false,
+    };
+
+    let perms = deno_runtime::deno_permissions::Permissions::from_options(
+        descriptor_parser.as_ref(),
+        &opts,
+    )
+    .unwrap();
+
+    deno_runtime::deno_permissions::PermissionsContainer::new(descriptor_parser, perms)
+}
+
+pub async fn new(
+    runtime_id: usize,
+    main_module_path: String,
+    permissions_json: String,
+) -> Result<MainWorker, Error> {
     let path = std::env::current_dir().unwrap().join(main_module_path);
     let main_module = deno_core::ModuleSpecifier::from_file_path(path).unwrap();
+    let permissions = build_permissions(&permissions_json);
     let mut worker = MainWorker::bootstrap_from_options(
         &main_module,
         deno_runtime::worker::WorkerServiceOptions::<
@@ -56,13 +128,7 @@ pub async fn new(runtime_id: usize, main_module_path: String) -> Result<MainWork
             module_loader: std::rc::Rc::new(deno_core::FsModuleLoader),
             node_services: Default::default(),
             npm_process_state_provider: Default::default(),
-            permissions: deno_runtime::deno_permissions::PermissionsContainer::allow_all(
-                std::sync::Arc::new(
-                    deno_runtime::permissions::RuntimePermissionDescriptorParser::new(
-                        sys_traits::impls::RealSys,
-                    ),
-                ),
-            ),
+            permissions,
             root_cert_store_provider: Default::default(),
             shared_array_buffer_store: Default::default(),
             v8_code_cache: Default::default(),

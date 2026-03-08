@@ -35,6 +35,7 @@ defmodule Tyrex.Pool do
     * `:size` - Number of runtimes. Defaults to `System.schedulers_online()`.
     * `:strategy` - Dispatch strategy module. Defaults to `Tyrex.Pool.Strategy.RoundRobin`.
     * `:main_module_path` - Path to the main JS module for all runtimes.
+    * `:permissions` - Runtime permissions. See `Tyrex.start/1` for details.
   """
   @spec start_link(Keyword.t()) :: Supervisor.on_start()
   def start_link(opts) do
@@ -47,7 +48,7 @@ defmodule Tyrex.Pool do
     name = Keyword.fetch!(opts, :name)
     size = Keyword.get(opts, :size, System.schedulers_online())
     strategy_mod = Keyword.get(opts, :strategy, Tyrex.Pool.Strategy.RoundRobin)
-    runtime_opts = Keyword.take(opts, [:main_module_path])
+    runtime_opts = Keyword.take(opts, [:main_module_path, :permissions])
 
     strategy_state = strategy_mod.init(name, size)
 

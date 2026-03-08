@@ -57,10 +57,38 @@ defmodule Tyrex do
 
     * `:main_module_path` - Path to the main JavaScript module. The default is
       to start the runtime without a main module.
+    * `:permissions` - Runtime permissions. Defaults to `:allow_all`.
+      See "Permissions" section below.
+
+  ## Permissions
+
+  Control what the JavaScript runtime can access:
+
+    * `:allow_all` — Full access to everything (default)
+    * `:none` — No permissions (JS can only compute, no I/O)
+    * Keyword list — Granular control per permission type
+
+  Each permission key accepts `true` (allow all), `false` (deny all),
+  or a list of specific allowed values:
+
+    * `:allow_net` / `:deny_net` — Network access (`true`, `false`, or `["host:port", ...]`)
+    * `:allow_read` / `:deny_read` — File read access (`true`, `false`, or `["/path", ...]`)
+    * `:allow_write` / `:deny_write` — File write access
+    * `:allow_env` / `:deny_env` — Environment variables (`true`, `false`, or `["VAR", ...]`)
+    * `:allow_run` / `:deny_run` — Subprocess execution
+    * `:allow_ffi` / `:deny_ffi` — Foreign function interface
+    * `:allow_sys` / `:deny_sys` — System info (hostname, OS, etc.)
+    * `:allow_import` — Dynamic imports
 
   ## Examples
 
       iex> Tyrex.start(main_module_path: "path/to/main.js")
+
+      # No permissions (pure computation only)
+      iex> Tyrex.start(permissions: :none)
+
+      # Only allow network and reading from /tmp
+      iex> Tyrex.start(permissions: [allow_net: true, allow_read: ["/tmp"]])
   """
   @spec start(Keyword.t()) :: GenServer.on_start()
   def start(opts) do
@@ -116,7 +144,7 @@ defmodule Tyrex do
   def start_link(opts) do
     GenServer.start_link(
       __MODULE__,
-      Keyword.take(opts, [:main_module_path]),
+      Keyword.take(opts, [:main_module_path, :permissions]),
       name: Keyword.get(opts, :name, __MODULE__)
     )
   end
@@ -202,7 +230,8 @@ defmodule Tyrex do
               opts,
               :main_module_path,
               "#{Application.app_dir(:tyrex)}/priv/main.js"
-            )
+            ),
+            encode_permissions(Keyword.get(opts, :permissions, :allow_all))
           )
 
         receive do
@@ -334,5 +363,25 @@ defmodule Tyrex do
   rescue
     ArgumentError ->
       {:error, "No existing atom: #{string}"}
+  end
+
+  defp encode_permissions(:allow_all), do: ~s("allow_all")
+
+  defp encode_permissions(:none) do
+    Jason.encode!(%{})
+  end
+
+  defp encode_permissions(opts) when is_list(opts) do
+    opts
+    |> Map.new(fn
+      {key, true} -> {key, true}
+      {key, false} -> {key, false}
+      {key, list} when is_list(list) -> {key, Enum.map(list, &to_string/1)}
+    end)
+    |> Jason.encode!()
+  end
+
+  defp encode_permissions(opts) when is_map(opts) do
+    Jason.encode!(opts)
   end
 end

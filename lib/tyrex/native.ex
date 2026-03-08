@@ -18,7 +18,8 @@ defmodule Tyrex.Native do
     ],
     version: version
 
-  def start_runtime(_pid, _main_module_path), do: :erlang.nif_error(:nif_not_loaded)
+  def start_runtime(_pid, _main_module_path, _permissions_json),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   def stop_runtime(_reference), do: :erlang.nif_error(:nif_not_loaded)
 
