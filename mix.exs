@@ -83,7 +83,8 @@ defmodule Tyrex.MixProject do
       {:jason, "~> 1.4"},
       {:rustler, "~> 0.35", optional: true},
       {:rustler_precompiled, "~> 0.7"},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:benchee, "~> 1.3", only: :dev, runtime: false}
     ]
   end
 end
