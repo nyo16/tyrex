@@ -367,6 +367,10 @@ sudo apt-get install libffi-dev   # Ubuntu/Debian
 sudo dnf install libffi-devel     # Fedora
 ```
 
+## Acknowledgements
+
+Tyrex is inspired by [deno_rider](https://github.com/nicolo-ribaudo/deno_rider), which pioneered the approach of embedding the Deno runtime in Elixir via Rustler NIFs. Tyrex builds on the same proven architecture while adding a runtime pool with pluggable dispatch strategies, an inline `~JS` sigil, granular permissions, and bidirectional Elixir/JS calls.
+
 ## License
 
 MIT
