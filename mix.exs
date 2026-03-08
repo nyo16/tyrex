@@ -36,6 +36,7 @@ defmodule Tyrex.MixProject do
     [
       files: [
         "checksum-Elixir.Tyrex.Native.exs",
+        "CHANGELOG.md",
         "LICENSE",
         "lib",
         "native/tyrex/Cargo.toml",
@@ -60,6 +61,7 @@ defmodule Tyrex.MixProject do
       main: "readme",
       extras: [
         "README.md",
+        "CHANGELOG.md",
         "LICENSE"
       ],
       source_ref: "v#{@version}",
