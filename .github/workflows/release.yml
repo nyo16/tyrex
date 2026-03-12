@@ -30,9 +30,9 @@ jobs:
         nif: ["2.15"]
         job:
           - { target: aarch64-apple-darwin, os: macos-14 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04, use-cross: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, v8-from-source: true }
           - { target: x86_64-apple-darwin, os: macos-14 }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, v8-from-source: true }
 
     steps:
       - name: Checkout source code
@@ -53,9 +53,27 @@ jobs:
         run: |
           rustup target add ${{ matrix.job.target }}
 
+      - name: Build V8 from source (Linux)
+        if: matrix.job.v8-from-source
+        shell: bash
+        run: |
+          # V8's prebuilt static library uses local-exec TLS which generates
+          # R_X86_64_TPOFF32 / R_AARCH64_TLSLE relocations incompatible with
+          # shared libraries (NIF .so loaded via dlopen). Build V8 from source
+          # with v8_monolithic_for_shared_library which switches TLS to
+          # local-dynamic model.
+          sudo apt-get update
+          sudo apt-get install -y python3 ninja-build pkg-config libglib2.0-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+          echo "V8_FROM_SOURCE=1" >> $GITHUB_ENV
+          echo "GN_ARGS=v8_monolithic=true v8_monolithic_for_shared_library=true" >> $GITHUB_ENV
+
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v0-precomp
+          prefix-key: v1-precomp
           shared-key: ${{ matrix.job.target }}-${{ matrix.nif }}
           workspaces: |
             native/tyrex
@@ -68,7 +86,7 @@ jobs:
           project-version: ${{ env.PROJECT_VERSION }}
           target: ${{ matrix.job.target }}
           nif-version: ${{ matrix.nif }}
-          use-cross: ${{ matrix.job.use-cross }}
+          use-cross: ${{ matrix.job.use-cross || false }}
           project-dir: "native/tyrex"
 
       - name: Artifact attestation
