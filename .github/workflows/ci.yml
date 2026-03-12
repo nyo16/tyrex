@@ -12,6 +12,7 @@ jobs:
     env:
       MIX_ENV: test
       TYREX_BUILD: "true"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     name: Elixir ${{ matrix.pair.elixir }} / OTP ${{ matrix.pair.otp }}
 
@@ -27,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: erlef/setup-beam@v2
+      - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ matrix.pair.otp }}
           elixir-version: ${{ matrix.pair.elixir }}
