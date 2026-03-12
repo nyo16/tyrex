@@ -69,7 +69,7 @@ jobs:
           sudo /tmp/llvm.sh 19
           echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
           echo "V8_FROM_SOURCE=1" >> $GITHUB_ENV
-          echo "GN_ARGS=v8_monolithic=true v8_monolithic_for_shared_library=true" >> $GITHUB_ENV
+          echo "EXTRA_GN_ARGS=v8_monolithic=true v8_monolithic_for_shared_library=true" >> $GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
         with:
