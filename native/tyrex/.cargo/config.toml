@@ -9,3 +9,15 @@ rustflags = [
 rustflags = [
   "-C", "target-feature=-crt-static"
 ]
+
+# V8 146.x uses initial-exec TLS model which is incompatible with shared
+# libraries. Allow text relocations so the NIF .so can link on Linux.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,notext"
+]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+  "-C", "link-arg=-Wl,-z,notext"
+]
