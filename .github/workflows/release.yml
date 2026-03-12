@@ -14,8 +14,95 @@ on:
       - ".github/workflows/release.yml"
   workflow_dispatch:
 
+env:
+  V8_TAG: "v146.4.0"
+
 jobs:
-  build_release:
+  # Build V8 archives with shared-library-compatible TLS model.
+  # V8's prebuilt static libraries use local-exec TLS (TPOFF32/TLSLE)
+  # which is incompatible with shared libraries loaded via dlopen (NIFs).
+  # Must build from the full rusty_v8 repo with v8_monolithic=true and
+  # v8_monolithic_for_shared_library=true to get local-dynamic TLS.
+  # Always runs on x86_64 — Chromium toolchain is x86_64-only.
+  # Cross-compiles for aarch64 using Chromium's clang + sysroot.
+  build_v8:
+    name: V8 archive - ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - name: Cache V8 archive
+        id: v8-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/v8-archives/librusty_v8_${{ matrix.target }}.a
+          key: v8-archive-${{ matrix.target }}-${{ env.V8_TAG }}-v1
+
+      - name: Install build dependencies
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 ninja-build pkg-config libglib2.0-dev git
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+
+      - name: Clone rusty_v8
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ env.V8_TAG }} --recurse-submodules \
+            https://github.com/denoland/rusty_v8.git /tmp/v8build
+
+      - name: Build V8 archive
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        working-directory: /tmp/v8build
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            mkdir -p .cargo
+            printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' > .cargo/config.toml
+          fi
+
+          export V8_FROM_SOURCE=1
+          export EXTRA_GN_ARGS="v8_monolithic=true v8_monolithic_for_shared_library=true"
+          echo "Building V8 for ${{ matrix.target }} with EXTRA_GN_ARGS: $EXTRA_GN_ARGS"
+
+          cargo build --release --target ${{ matrix.target }}
+
+          ARCHIVE=$(find target/${{ matrix.target }}/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)
+          if [ -z "$ARCHIVE" ]; then
+            ARCHIVE=$(find target/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)
+          fi
+          if [ -z "$ARCHIVE" ]; then
+            echo "ERROR: librusty_v8.a not found!"
+            find target/ -name "librusty_v8*" 2>/dev/null
+            exit 1
+          fi
+
+          mkdir -p /tmp/v8-archives
+          cp "$ARCHIVE" /tmp/v8-archives/librusty_v8_${{ matrix.target }}.a
+          ls -lh /tmp/v8-archives/librusty_v8_${{ matrix.target }}.a
+
+      - name: Upload V8 archive
+        uses: actions/upload-artifact@v5
+        with:
+          name: v8-archive-${{ matrix.target }}
+          path: /tmp/v8-archives/librusty_v8_${{ matrix.target }}.a
+
+  build_macos:
     name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
 
@@ -30,9 +117,7 @@ jobs:
         nif: ["2.15"]
         job:
           - { target: aarch64-apple-darwin, os: macos-14 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, v8-from-source: true }
           - { target: x86_64-apple-darwin, os: macos-14 }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, v8-from-source: true }
 
     steps:
       - name: Checkout source code
@@ -50,26 +135,7 @@ jobs:
 
       - name: Add target
         shell: bash
-        run: |
-          rustup target add ${{ matrix.job.target }}
-
-      - name: Build V8 from source (Linux)
-        if: matrix.job.v8-from-source
-        shell: bash
-        run: |
-          # V8's prebuilt static library uses local-exec TLS which generates
-          # R_X86_64_TPOFF32 / R_AARCH64_TLSLE relocations incompatible with
-          # shared libraries (NIF .so loaded via dlopen). Build V8 from source
-          # with v8_monolithic_for_shared_library which switches TLS to
-          # local-dynamic model.
-          sudo apt-get update
-          sudo apt-get install -y python3 ninja-build pkg-config libglib2.0-dev
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19
-          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
-          echo "V8_FROM_SOURCE=1" >> $GITHUB_ENV
-          echo "EXTRA_GN_ARGS=v8_monolithic=true v8_monolithic_for_shared_library=true" >> $GITHUB_ENV
+        run: rustup target add ${{ matrix.job.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -86,8 +152,115 @@ jobs:
           project-version: ${{ env.PROJECT_VERSION }}
           target: ${{ matrix.job.target }}
           nif-version: ${{ matrix.nif }}
-          use-cross: ${{ matrix.job.use-cross || false }}
+          use-cross: false
           project-dir: "native/tyrex"
+
+      - name: Artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ steps.build-crate.outputs.file-path }}
+
+      - name: Artifact upload
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.build-crate.outputs.file-name }}
+          path: ${{ steps.build-crate.outputs.file-path }}
+
+      - name: Publish archives and packages
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.build-crate.outputs.file-path }}
+        if: startsWith(github.ref, 'refs/tags/')
+
+  build_linux:
+    name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
+    needs: build_v8
+    runs-on: ${{ matrix.job.os }}
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        nif: ["2.15"]
+        job:
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Extract project version
+        shell: bash
+        run: |
+          echo "PROJECT_VERSION=$(sed -n 's/.*@version "\([^"]*\)".*/\1/p' mix.exs | head -n1)" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - name: Add target
+        shell: bash
+        run: rustup target add ${{ matrix.job.target }}
+
+      - name: Download V8 archive
+        uses: actions/download-artifact@v4
+        with:
+          name: v8-archive-${{ matrix.job.target }}
+          path: /tmp/v8-archives
+
+      - name: Configure V8 archive
+        shell: bash
+        run: |
+          ls -lh /tmp/v8-archives/
+          echo "RUSTY_V8_ARCHIVE=/tmp/v8-archives/librusty_v8_${{ matrix.job.target }}.a" >> $GITHUB_ENV
+
+      - name: Install LLVM for bindgen
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libglib2.0-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v3-precomp
+          shared-key: ${{ matrix.job.target }}-${{ matrix.nif }}
+          workspaces: |
+            native/tyrex
+
+      - name: Build the project
+        id: build-crate
+        uses: philss/rustler-precompiled-action@v1.1.4
+        with:
+          project-name: tyrex
+          project-version: ${{ env.PROJECT_VERSION }}
+          target: ${{ matrix.job.target }}
+          nif-version: ${{ matrix.nif }}
+          use-cross: false
+          project-dir: "native/tyrex"
+
+      - name: Verify no TPOFF32 relocations
+        shell: bash
+        run: |
+          SO_FILE=$(find native/tyrex/target/${{ matrix.job.target }}/release -name "libtyrex.so" -type f | head -1)
+          if [ -n "$SO_FILE" ]; then
+            TPOFF=$(readelf -r "$SO_FILE" 2>/dev/null | grep -c TPOFF32 || true)
+            echo "TPOFF32 relocations: $TPOFF"
+            if [ "$TPOFF" -gt 0 ]; then
+              echo "::error::TPOFF32 relocations found in output - V8 TLS model is wrong"
+              exit 1
+            fi
+          fi
 
       - name: Artifact attestation
         uses: actions/attest-build-provenance@v3
