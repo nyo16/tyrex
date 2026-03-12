@@ -78,9 +78,12 @@ jobs:
 
           export V8_FROM_SOURCE=1
           export EXTRA_GN_ARGS="v8_monolithic=true v8_monolithic_for_shared_library=true"
-          echo "Building V8 for ${{ matrix.target }} with EXTRA_GN_ARGS: $EXTRA_GN_ARGS"
+          export PRINT_GN_ARGS=1
+          echo "Building V8 for ${{ matrix.target }}"
+          echo "V8_FROM_SOURCE=$V8_FROM_SOURCE"
+          echo "EXTRA_GN_ARGS=$EXTRA_GN_ARGS"
 
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} 2>&1
 
           ARCHIVE=$(find target/${{ matrix.target }}/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)
           if [ -z "$ARCHIVE" ]; then
@@ -89,6 +92,18 @@ jobs:
           if [ -z "$ARCHIVE" ]; then
             echo "ERROR: librusty_v8.a not found!"
             find target/ -name "librusty_v8*" 2>/dev/null
+            exit 1
+          fi
+
+          echo "=== Verifying V8 archive TLS model ==="
+          TPOFF=$(readelf -r "$ARCHIVE" 2>/dev/null | grep -c TPOFF32 || true)
+          TLSLE=$(readelf -r "$ARCHIVE" 2>/dev/null | grep -cE 'TLSLE|TLS_TPREL' || true)
+          echo "TPOFF32 relocations: $TPOFF"
+          echo "TLSLE relocations: $TLSLE"
+          if [ "$TPOFF" -gt 0 ] || [ "$TLSLE" -gt 0 ]; then
+            echo "::error::V8 archive still has local-exec TLS relocations!"
+            echo "Checking args.gn for v8_monolithic flags..."
+            find target/ -name "args.gn" -exec cat {} \; 2>/dev/null || true
             exit 1
           fi
 
@@ -219,7 +234,16 @@ jobs:
         shell: bash
         run: |
           ls -lh /tmp/v8-archives/
-          echo "RUSTY_V8_ARCHIVE=/tmp/v8-archives/librusty_v8_${{ matrix.job.target }}.a" >> $GITHUB_ENV
+          ARCHIVE="/tmp/v8-archives/librusty_v8_${{ matrix.job.target }}.a"
+          echo "RUSTY_V8_ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+          echo "=== Verifying downloaded V8 archive ==="
+          TPOFF=$(readelf -r "$ARCHIVE" 2>/dev/null | grep -c TPOFF32 || true)
+          echo "TPOFF32 in downloaded archive: $TPOFF"
+          if [ "$TPOFF" -gt 0 ]; then
+            echo "::error::Downloaded V8 archive has TPOFF32 relocations!"
+            exit 1
+          fi
 
       - name: Install LLVM for bindgen
         shell: bash
