@@ -7836,6 +7836,7 @@ dependencies = [
  "deno_resolver",
  "deno_runtime",
  "libffi-sys",
+ "libsqlite3-sys",
  "rustler",
  "serde",
  "serde_json",

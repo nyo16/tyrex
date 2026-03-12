@@ -11,6 +11,11 @@ slab = "0.4.9"
 sys_traits = "=0.1.24"
 tokio = "1.47.1"
 
+# Transitive dep via deno_kv → rusqlite. Enable bundled so it compiles
+# SQLite from source with pre-generated bindings (no libclang needed
+# for cross-compilation).
+libsqlite3-sys = { version = "0.35.0", features = ["bundled"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 libffi-sys = { version = "=4.1.0", features = ["system"] }
 
