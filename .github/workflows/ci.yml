@@ -6,6 +6,9 @@ on:
     branches:
       - master
 
+env:
+  V8_TAG: "v146.4.0"
+
 jobs:
   mix_test:
     runs-on: ubuntu-latest
@@ -28,10 +31,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: erlef/setup-beam@v1
+      - name: Cache V8 archive
+        id: v8-cache
+        uses: actions/cache@v4
         with:
-          otp-version: ${{ matrix.pair.otp }}
-          elixir-version: ${{ matrix.pair.elixir }}
+          path: /tmp/v8-archives/librusty_v8_x86_64-unknown-linux-gnu.a
+          key: v8-archive-x86_64-unknown-linux-gnu-${{ env.V8_TAG }}-v1
+
+      - name: Install V8 build dependencies
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 ninja-build pkg-config libglib2.0-dev git
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,27 +55,70 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt
 
-      - name: Build V8 from source with shared-library TLS model
+      - name: Clone rusty_v8
+        if: steps.v8-cache.outputs.cache-hit != 'true'
         run: |
-          # V8 146.x prebuilt archives use local-exec TLS (TPOFF32) which is
-          # incompatible with shared libraries (NIFs loaded via dlopen).
-          # Build from source with v8_monolithic + v8_monolithic_for_shared_library
-          # to switch to local-dynamic TLS.
-          sudo apt-get update
-          sudo apt-get install -y python3 ninja-build pkg-config libglib2.0-dev
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19
-          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
-          echo "V8_FROM_SOURCE=1" >> $GITHUB_ENV
-          echo "EXTRA_GN_ARGS=v8_monolithic=true v8_monolithic_for_shared_library=true" >> $GITHUB_ENV
-          echo "PRINT_GN_ARGS=1" >> $GITHUB_ENV
+          git clone --depth 1 --branch ${{ env.V8_TAG }} --recurse-submodules \
+            https://github.com/denoland/rusty_v8.git /tmp/v8build
+
+      - name: Build V8 archive
+        if: steps.v8-cache.outputs.cache-hit != 'true'
+        working-directory: /tmp/v8build
+        run: |
+          export V8_FROM_SOURCE=1
+          export EXTRA_GN_ARGS="v8_monolithic=true v8_monolithic_for_shared_library=true"
+          echo "Building V8 for x86_64-unknown-linux-gnu"
+          echo "EXTRA_GN_ARGS=$EXTRA_GN_ARGS"
+
+          cargo build --release --target x86_64-unknown-linux-gnu 2>&1
+
+          ARCHIVE=$(find target/x86_64-unknown-linux-gnu/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)
+          if [ -z "$ARCHIVE" ]; then
+            ARCHIVE=$(find target/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)
+          fi
+          if [ -z "$ARCHIVE" ]; then
+            echo "ERROR: librusty_v8.a not found!"
+            find target/ -name "librusty_v8*" 2>/dev/null
+            exit 1
+          fi
+
+          echo "=== Verifying V8 archive TLS model ==="
+          TPOFF=$(readelf -r "$ARCHIVE" 2>/dev/null | grep -c TPOFF32 || true)
+          echo "TPOFF32 relocations: $TPOFF"
+          if [ "$TPOFF" -gt 0 ]; then
+            echo "::error::V8 archive has local-exec TLS relocations!"
+            exit 1
+          fi
+
+          mkdir -p /tmp/v8-archives
+          cp "$ARCHIVE" /tmp/v8-archives/librusty_v8_x86_64-unknown-linux-gnu.a
+          ls -lh /tmp/v8-archives/librusty_v8_x86_64-unknown-linux-gnu.a
+
+      - name: Configure V8 archive
+        run: |
+          echo "RUSTY_V8_ARCHIVE=/tmp/v8-archives/librusty_v8_x86_64-unknown-linux-gnu.a" >> $GITHUB_ENV
+          # Ensure LIBCLANG_PATH is set even on cache hit
+          if [ -z "$LIBCLANG_PATH" ]; then
+            if [ ! -d "/usr/lib/llvm-19/lib" ]; then
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends pkg-config libglib2.0-dev
+              wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+              chmod +x /tmp/llvm.sh
+              sudo /tmp/llvm.sh 19
+            fi
+            echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+          fi
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v1-ci
+          prefix-key: v2-ci
           workspaces: |
             native/tyrex
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.pair.otp }}
+          elixir-version: ${{ matrix.pair.elixir }}
 
       - name: Install dependencies
         run: mix deps.get
