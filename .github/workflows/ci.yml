@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@v2
         with:
           otp-version: ${{ matrix.pair.otp }}
           elixir-version: ${{ matrix.pair.elixir }}
@@ -37,6 +37,28 @@ jobs:
         with:
           toolchain: 1.92.0
           components: rustfmt
+
+      - name: Build V8 from source with shared-library TLS model
+        run: |
+          # V8 146.x prebuilt archives use local-exec TLS (TPOFF32) which is
+          # incompatible with shared libraries (NIFs loaded via dlopen).
+          # Build from source with v8_monolithic + v8_monolithic_for_shared_library
+          # to switch to local-dynamic TLS.
+          sudo apt-get update
+          sudo apt-get install -y python3 ninja-build pkg-config libglib2.0-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+          echo "V8_FROM_SOURCE=1" >> $GITHUB_ENV
+          echo "EXTRA_GN_ARGS=v8_monolithic=true v8_monolithic_for_shared_library=true" >> $GITHUB_ENV
+          echo "PRINT_GN_ARGS=1" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-ci
+          workspaces: |
+            native/tyrex
 
       - name: Install dependencies
         run: mix deps.get
