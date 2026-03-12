@@ -1,0 +1,10 @@
+FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main
+
+RUN apt-get update && \
+    apt-get install -y wget software-properties-common gnupg && \
+    wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && \
+    chmod +x /tmp/llvm.sh && \
+    /tmp/llvm.sh 14 && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
