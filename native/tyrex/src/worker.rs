@@ -34,7 +34,10 @@ deno_core::extension!(
     extension,
     ops = [op_apply],
     esm_entry_point = "ext:extension/main.js",
-    esm = [dir "extension", "main.js"]
+    esm = [dir "extension", "main.js"],
+    state = |state| {
+        state.put(deno_runtime::ops::bootstrap::SnapshotOptions::default());
+    }
 );
 
 fn parse_string_list(value: &serde_json::Value) -> Option<Vec<String>> {
@@ -75,8 +78,12 @@ fn build_permissions(
     }
 
     let obj = parsed.as_object().unwrap();
+
+    if obj.get("allow_all").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser);
+    }
+
     let opts = deno_runtime::deno_permissions::PermissionsOptions {
-        allow_all: obj.get("allow_all").and_then(|v| v.as_bool()).unwrap_or(false),
         allow_env: obj.get("allow_env").and_then(parse_string_list),
         deny_env: obj.get("deny_env").and_then(parse_string_list),
         allow_net: obj.get("allow_net").and_then(parse_string_list),
@@ -92,6 +99,9 @@ fn build_permissions(
         allow_write: obj.get("allow_write").and_then(parse_string_list),
         deny_write: obj.get("deny_write").and_then(parse_string_list),
         allow_import: obj.get("allow_import").and_then(parse_string_list),
+        deny_import: obj.get("deny_import").and_then(parse_string_list),
+        ignore_env: None,
+        ignore_read: None,
         prompt: false,
     };
 
@@ -109,6 +119,8 @@ pub async fn new(
     main_module_path: String,
     permissions_json: String,
 ) -> Result<MainWorker, Error> {
+    let _ = deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider()
+        .install_default();
     let path = std::env::current_dir().unwrap().join(main_module_path);
     let main_module = deno_core::ModuleSpecifier::from_file_path(path).unwrap();
     let permissions = build_permissions(&permissions_json);
@@ -132,9 +144,11 @@ pub async fn new(
             root_cert_store_provider: Default::default(),
             shared_array_buffer_store: Default::default(),
             v8_code_cache: Default::default(),
+            deno_rt_native_addon_loader: None,
+            bundle_provider: None,
         },
         deno_runtime::worker::WorkerOptions {
-            extensions: vec![extension::init_ops_and_esm()],
+            extensions: vec![extension::init()],
             ..Default::default()
         },
     );
@@ -189,13 +203,13 @@ pub async fn run(
                         match worker.execute_script("<anon>", code.into()) {
                             Ok(global) => {
                                 if {
-                                    let scope = &mut worker.js_runtime.handle_scope();
+                                    deno_core::scope!(scope, worker.js_runtime);
                                     let local = deno_core::v8::Local::new(scope, &global);
                                     local.is_promise()
                                 } {
                                     promises.insert((global, response_sender));
                                 } else {
-                                    let scope = &mut worker.js_runtime.handle_scope();
+                                    deno_core::scope!(scope, worker.js_runtime);
                                     let local = deno_core::v8::Local::new(scope, &global);
                                     match serde_v8::from_v8::<serde_json::Value>(scope, local) {
                                         Ok(value) => {
@@ -250,7 +264,7 @@ async fn run_event_loop(
 ) -> Result<(), deno_core::error::CoreError> {
     std::future::poll_fn(|cx| {
         let poll = worker.js_runtime.poll_event_loop(cx, Default::default());
-        let scope = &mut worker.js_runtime.handle_scope();
+        deno_core::scope!(scope, worker.js_runtime);
         let resolved_promises: Vec<_> = promises
             .iter()
             .filter_map(|(key, (global, _))| {

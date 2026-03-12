@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.0 (2026-03-11)
+
+### Changed
+
+- Upgraded embedded Deno runtime to v2.7.5
+  - deno_core 0.330.0 → 0.391.0
+  - deno_runtime 0.194.0 → 0.246.0
+  - deno_fs 0.96.0 → 0.148.0
+  - deno_resolver 0.17.0 → 0.69.0
+  - serde_v8 0.239.0 → 0.300.0
+  - sys_traits 0.1.7 → 0.1.24
+- Added `deny_import` permission option
+- Relaxed serde version pin
+
 ## v0.1.0 (2026-03-08)
 
 Initial release.
