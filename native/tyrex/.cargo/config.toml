@@ -11,13 +11,16 @@ rustflags = [
 ]
 
 # V8 146.x uses initial-exec TLS model which is incompatible with shared
-# libraries. Allow text relocations so the NIF .so can link on Linux.
+# libraries. Force GNU ld (rust-lld ignores -z notext for TPOFF32) and
+# allow text relocations so the NIF .so can link on Linux.
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
+  "-C", "link-arg=-fuse-ld=bfd",
   "-C", "link-arg=-Wl,-z,notext"
 ]
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = [
+  "-C", "link-arg=-fuse-ld=bfd",
   "-C", "link-arg=-Wl,-z,notext"
 ]
