@@ -44,11 +44,11 @@ else
         curl ca-certificates build-essential python3 ninja-build git \
         pkg-config libglib2.0-dev wget software-properties-common gnupg lsb-release
 
-      # Install LLVM 19 for bindgen
+      # Install LLVM 20 for bindgen (V8 libc++ headers require Clang 20+)
       wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
       chmod +x /tmp/llvm.sh
-      /tmp/llvm.sh 19
-      export LIBCLANG_PATH=/usr/lib/llvm-19/lib
+      /tmp/llvm.sh 20
+      export LIBCLANG_PATH=/usr/lib/llvm-20/lib
 
       # Install Rust with the target
       curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0

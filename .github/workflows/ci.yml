@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/v8-archives/librusty_v8_x86_64-unknown-linux-gnu.a
-          key: v8-archive-x86_64-unknown-linux-gnu-${{ env.V8_TAG }}-v1
+          key: v8-archive-x86_64-unknown-linux-gnu-${{ env.V8_TAG }}-v2
 
       - name: Install V8 build dependencies
         if: steps.v8-cache.outputs.cache-hit != 'true'
@@ -46,8 +46,8 @@ jobs:
             python3 ninja-build pkg-config libglib2.0-dev git
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19
-          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+          sudo /tmp/llvm.sh 20
+          echo "LIBCLANG_PATH=/usr/lib/llvm-20/lib" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -99,14 +99,14 @@ jobs:
           echo "RUSTY_V8_ARCHIVE=/tmp/v8-archives/librusty_v8_x86_64-unknown-linux-gnu.a" >> $GITHUB_ENV
           # Ensure LIBCLANG_PATH is set even on cache hit
           if [ -z "$LIBCLANG_PATH" ]; then
-            if [ ! -d "/usr/lib/llvm-19/lib" ]; then
+            if [ ! -d "/usr/lib/llvm-20/lib" ]; then
               sudo apt-get update
               sudo apt-get install -y --no-install-recommends pkg-config libglib2.0-dev
               wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
               chmod +x /tmp/llvm.sh
-              sudo /tmp/llvm.sh 19
+              sudo /tmp/llvm.sh 20
             fi
-            echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> $GITHUB_ENV
+            echo "LIBCLANG_PATH=/usr/lib/llvm-20/lib" >> $GITHUB_ENV
           fi
 
       - uses: Swatinem/rust-cache@v2
