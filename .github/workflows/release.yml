@@ -226,16 +226,44 @@ jobs:
           workspaces: |
             native/tyrex
 
-      - name: Build the project
-        id: build-crate
-        uses: philss/rustler-precompiled-action@v1.1.4
-        with:
-          project-name: tyrex
-          project-version: ${{ env.PROJECT_VERSION }}
-          target: ${{ matrix.target }}
-          nif-version: "2.16"
-          use-cross: false
-          project-dir: "native/tyrex"
+      - name: Build the NIF
+        shell: bash
+        run: |
+          cd native/tyrex
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package NIF archive
+        id: package-nif
+        shell: bash
+        run: |
+          TARGET="${{ matrix.target }}"
+          VERSION="${{ env.PROJECT_VERSION }}"
+
+          # Determine library file name by platform
+          if [[ "$TARGET" == *"apple"* ]]; then
+            LIB_FILE="libtyrex.dylib"
+            ARCHIVE_SUFFIX=".so"
+          else
+            LIB_FILE="libtyrex.so"
+            ARCHIVE_SUFFIX=".so"
+          fi
+
+          SRC="native/tyrex/target/$TARGET/release/$LIB_FILE"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::Built library not found at $SRC"
+            ls -la native/tyrex/target/$TARGET/release/ || true
+            exit 1
+          fi
+
+          ARCHIVE_NAME="libtyrex-v${VERSION}-nif-2.16-${TARGET}${ARCHIVE_SUFFIX}.tar.gz"
+          tar -czf "$ARCHIVE_NAME" -C "native/tyrex/target/$TARGET/release" "$LIB_FILE"
+          CHECKSUM=$(shasum -a 256 "$ARCHIVE_NAME" | cut -d ' ' -f 1)
+
+          echo "file-name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          echo "file-path=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          echo "file-sha256=$CHECKSUM" >> $GITHUB_OUTPUT
+          echo "=== Built: $ARCHIVE_NAME (sha256: $CHECKSUM) ==="
+          ls -lh "$ARCHIVE_NAME"
 
       - name: Verify no TPOFF32 relocations
         if: matrix.platform == 'linux'
@@ -254,17 +282,17 @@ jobs:
       - name: Artifact attestation
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: ${{ steps.build-crate.outputs.file-path }}
+          subject-path: ${{ steps.package-nif.outputs.file-path }}
 
       - name: Artifact upload
         uses: actions/upload-artifact@v5
         with:
-          name: ${{ steps.build-crate.outputs.file-name }}
-          path: ${{ steps.build-crate.outputs.file-path }}
+          name: ${{ steps.package-nif.outputs.file-name }}
+          path: ${{ steps.package-nif.outputs.file-path }}
 
       - name: Publish archives and packages
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ steps.build-crate.outputs.file-path }}
+            ${{ steps.package-nif.outputs.file-path }}
         if: startsWith(github.ref, 'refs/tags/')
