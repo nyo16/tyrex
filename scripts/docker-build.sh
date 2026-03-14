@@ -80,7 +80,9 @@ else
 
       echo "=== Building V8 for $RUST_TARGET (this takes 30-60 min) ==="
       echo "EXTRA_GN_ARGS: $EXTRA_GN_ARGS"
-      cargo build --release --target "$RUST_TARGET" 2>&1
+      # Build may fail at bindgen (Chromium libc++ vs system libclang),
+      # but librusty_v8.a is produced before that step.
+      cargo build --release --target "$RUST_TARGET" 2>&1 || true
 
       # Copy the archive out
       ARCHIVE=$(find target/"$RUST_TARGET"/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)

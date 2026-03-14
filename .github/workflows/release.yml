@@ -83,7 +83,10 @@ jobs:
           echo "V8_FROM_SOURCE=$V8_FROM_SOURCE"
           echo "EXTRA_GN_ARGS=$EXTRA_GN_ARGS"
 
-          cargo build --release --target ${{ matrix.target }} 2>&1
+          # Build will fail at bindgen step (Chromium libc++ headers incompatible
+          # with system libclang), but librusty_v8.a is produced before that.
+          # We only need the .a file; bindings come from the rusty_v8 release.
+          cargo build --release --target ${{ matrix.target }} 2>&1 || true
 
           ARCHIVE=$(find target/${{ matrix.target }}/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)
           if [ -z "$ARCHIVE" ]; then
@@ -173,6 +176,15 @@ jobs:
           name: v8-archive-${{ matrix.target }}
           path: /tmp/v8-archives
 
+      - name: Download pre-generated V8 bindings
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          BINDING_FILE="src_binding_release_${{ matrix.target }}.rs"
+          curl -L -o /tmp/v8-archives/$BINDING_FILE \
+            "https://github.com/denoland/rusty_v8/releases/download/${{ env.V8_TAG }}/$BINDING_FILE"
+          ls -lh /tmp/v8-archives/$BINDING_FILE
+
       - name: Configure V8 archive
         if: matrix.platform == 'linux'
         shell: bash
@@ -180,6 +192,7 @@ jobs:
           ls -lh /tmp/v8-archives/
           ARCHIVE="/tmp/v8-archives/librusty_v8_${{ matrix.target }}.a"
           echo "RUSTY_V8_ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          echo "RUSTY_V8_SRC_BINDING_PATH=/tmp/v8-archives/src_binding_release_${{ matrix.target }}.rs" >> $GITHUB_ENV
 
           echo "=== Verifying downloaded V8 archive ==="
           TPOFF=$(readelf -r "$ARCHIVE" 2>/dev/null | grep -c TPOFF32 || true)
