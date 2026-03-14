@@ -4,7 +4,8 @@ set -euo pipefail
 # Build NIF for a given Linux target inside Docker.
 # Two-phase build:
 #   Phase 1: Build custom V8 archive from rusty_v8 repo with shared-library-compatible TLS.
-#            Builds natively on the target platform (no cross-compilation).
+#            Always uses x86_64 container (Chromium toolchain is x86_64-only).
+#            Cross-compiles for arm64 targets.
 #   Phase 2: Build the NIF using the custom V8 archive on the target platform.
 #
 # Usage: ./scripts/docker-build.sh <target>
@@ -27,9 +28,10 @@ echo "=== Phase 1: Build V8 archive for $TARGET ==="
 if [ -f "$ARCHIVE_FILE" ]; then
   echo "Archive already exists at $ARCHIVE_FILE, skipping Phase 1"
 else
-  # Build V8 natively on the target platform - no cross-compilation needed.
+  # Always build V8 in x86_64 container - Chromium toolchain is x86_64-only.
+  # For arm64 targets, Chromium clang cross-compiles natively.
   docker run --rm \
-    --platform "$PLATFORM" \
+    --platform "linux/amd64" \
     -v "$ARCHIVE_DIR":/output \
     -e V8_TAG="$V8_TAG" \
     -e RUST_TARGET="$RUST_TARGET" \
@@ -51,12 +53,24 @@ else
       # Install Rust with the target
       curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0
       export PATH="$HOME/.cargo/bin:$PATH"
+      rustup target add "$RUST_TARGET"
+
+      # Install cross-compilation linker for arm64 if needed
+      if [ "$RUST_TARGET" = "aarch64-unknown-linux-gnu" ]; then
+        apt-get install -y gcc-aarch64-linux-gnu
+      fi
 
       # Clone rusty_v8
       echo "=== Cloning rusty_v8 at $V8_TAG ==="
       git clone --depth 1 --branch "$V8_TAG" --recurse-submodules \
         https://github.com/denoland/rusty_v8.git /v8build
       cd /v8build
+
+      # Set up cross-compilation cargo config for arm64
+      if [ "$RUST_TARGET" = "aarch64-unknown-linux-gnu" ]; then
+        mkdir -p .cargo
+        printf "[target.aarch64-unknown-linux-gnu]\nlinker = \"aarch64-linux-gnu-gcc\"\n" > .cargo/config.toml
+      fi
 
       # Build V8 from source with shared-library-compatible TLS model.
       # v8_monolithic_for_shared_library=true defines V8_TLS_USED_IN_LIBRARY

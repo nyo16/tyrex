@@ -23,16 +23,15 @@ jobs:
   # which is incompatible with shared libraries loaded via dlopen (NIFs).
   # Must build from the full rusty_v8 repo with v8_monolithic=true and
   # v8_monolithic_for_shared_library=true to get local-dynamic TLS.
-  # Each target builds natively on its own architecture.
+  # Always runs on x86_64 — Chromium's internal toolchain (clang, rustc)
+  # is x86_64-only. Cross-compiles for aarch64 using Chromium's clang + sysroot.
   build_v8:
     name: V8 archive - ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-24.04 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
     steps:
       - name: Cache V8 archive
         id: v8-cache
@@ -51,6 +50,9 @@ jobs:
           chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 20
           echo "LIBCLANG_PATH=/usr/lib/llvm-20/lib" >> $GITHUB_ENV
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
 
       - name: Install Rust toolchain
         if: steps.v8-cache.outputs.cache-hit != 'true'
@@ -69,6 +71,11 @@ jobs:
         if: steps.v8-cache.outputs.cache-hit != 'true'
         working-directory: /tmp/v8build
         run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            mkdir -p .cargo
+            printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' > .cargo/config.toml
+          fi
+
           export V8_FROM_SOURCE=1
           export EXTRA_GN_ARGS="v8_monolithic=true v8_monolithic_for_shared_library=true"
           export PRINT_GN_ARGS=1
