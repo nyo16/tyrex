@@ -44,9 +44,11 @@ fn parse_string_list(value: &serde_json::Value) -> Option<Vec<String>> {
     match value {
         serde_json::Value::Bool(true) => Some(vec![]),
         serde_json::Value::Bool(false) => None,
-        serde_json::Value::Array(arr) => {
-            Some(arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        }
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -79,7 +81,11 @@ fn build_permissions(
 
     let obj = parsed.as_object().unwrap();
 
-    if obj.get("allow_all").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if obj
+        .get("allow_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser);
     }
 
@@ -119,8 +125,7 @@ pub async fn new(
     main_module_path: String,
     permissions_json: String,
 ) -> Result<MainWorker, Error> {
-    let _ = deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider()
-        .install_default();
+    let _ = deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let path = std::env::current_dir().unwrap().join(main_module_path);
     let main_module = deno_core::ModuleSpecifier::from_file_path(path).unwrap();
     let permissions = build_permissions(&permissions_json);
