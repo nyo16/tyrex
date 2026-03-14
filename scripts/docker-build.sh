@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build NIF for a given Linux target inside Docker.
 # Two-phase build:
-#   Phase 1: Build custom V8 archive from rusty_v8 repo with shared-library-compatible TLS
+#   Phase 1: Build custom V8 archive from rusty_v8 repo with shared-library-compatible TLS.
 #            Always uses x86_64 container (Chromium toolchain is x86_64-only).
 #            Cross-compiles for arm64 targets.
 #   Phase 2: Build the NIF using the custom V8 archive on the target platform.
@@ -80,7 +80,9 @@ else
 
       echo "=== Building V8 for $RUST_TARGET (this takes 30-60 min) ==="
       echo "EXTRA_GN_ARGS: $EXTRA_GN_ARGS"
-      cargo build --release --target "$RUST_TARGET" 2>&1
+      # Build may fail at bindgen (Chromium libc++ vs system libclang),
+      # but librusty_v8.a is produced before that step.
+      cargo build --release --target "$RUST_TARGET" 2>&1 || true
 
       # Copy the archive out
       ARCHIVE=$(find target/"$RUST_TARGET"/release/gn_out -name "librusty_v8.a" 2>/dev/null | head -1)
@@ -118,7 +120,7 @@ docker run --rm \
   -e CARGO_HOME=/cargo \
   -e RUSTUP_HOME=/rustup \
   -e "RUSTY_V8_ARCHIVE=/v8-archives/librusty_v8_${TARGET}.a" \
-  -e RUSTLER_NIF_VERSION=2.15 \
+  -e RUSTLER_NIF_VERSION=2.16 \
   ubuntu:24.04 bash -exc '
     cp -a /build/native/tyrex/* /work/
     cp -a /build/native/tyrex/.cargo /work/ 2>/dev/null || true
@@ -128,11 +130,11 @@ docker run --rm \
       curl ca-certificates build-essential pkg-config libglib2.0-dev \
       wget software-properties-common gnupg
 
-    # Install LLVM 19 for bindgen
+    # Install LLVM 20 for bindgen (V8 libc++ headers require Clang 20+)
     wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
     chmod +x /tmp/llvm.sh
-    /tmp/llvm.sh 19
-    export LIBCLANG_PATH=/usr/lib/llvm-19/lib
+    /tmp/llvm.sh 20
+    export LIBCLANG_PATH=/usr/lib/llvm-20/lib
 
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.92.0
     export PATH="$CARGO_HOME/bin:$PATH"
