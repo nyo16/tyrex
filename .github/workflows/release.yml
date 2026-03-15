@@ -242,10 +242,8 @@ jobs:
           # Determine library file name by platform
           if [[ "$TARGET" == *"apple"* ]]; then
             LIB_FILE="libtyrex.dylib"
-            ARCHIVE_SUFFIX=".so"
           else
             LIB_FILE="libtyrex.so"
-            ARCHIVE_SUFFIX=".so"
           fi
 
           SRC="native/tyrex/target/$TARGET/release/$LIB_FILE"
@@ -255,8 +253,16 @@ jobs:
             exit 1
           fi
 
-          ARCHIVE_NAME="libtyrex-v${VERSION}-nif-2.16-${TARGET}${ARCHIVE_SUFFIX}.tar.gz"
-          tar -czf "$ARCHIVE_NAME" -C "native/tyrex/target/$TARGET/release" "$LIB_FILE"
+          # RustlerPrecompiled expects the file inside the tar to be named
+          # libtyrex-v{version}-nif-{nif_version}-{target}.so (always .so)
+          NIF_NAME="libtyrex-v${VERSION}-nif-2.16-${TARGET}.so"
+          ARCHIVE_NAME="${NIF_NAME}.tar.gz"
+
+          TMPDIR=$(mktemp -d)
+          cp "$SRC" "$TMPDIR/$NIF_NAME"
+          tar -czf "$ARCHIVE_NAME" -C "$TMPDIR" "$NIF_NAME"
+          rm -rf "$TMPDIR"
+
           CHECKSUM=$(shasum -a 256 "$ARCHIVE_NAME" | cut -d ' ' -f 1)
 
           echo "file-name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT

@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.2.1 (2026-03-14)
+
+### Fixed
+
+- Fixed precompiled NIF archive packaging — files inside tar.gz are now named
+  to match RustlerPrecompiled convention (`libtyrex-v{version}-nif-2.16-{target}.so`)
+- Fixed CI: V8 source builds now work on all targets (tolerate bindgen failure,
+  use pre-generated bindings from rusty_v8 releases)
+- Replaced `philss/rustler-precompiled-action` with manual cargo build + tar
+  (action installed cross even with `use-cross: false`)
+- Fixed macOS runner: `macos-13` deprecated, switched to `macos-15`
+- Fixed LLVM 19 → 20 in docker-build.sh Phase 2
+
+### Changed
+
+- NIF version 2.15 → 2.16 (requires OTP 27+)
+- Removed Windows (`x86_64-pc-windows-msvc`) target (not building it)
+- Upgraded Deno embedded runtime to v2.7.5 (see v0.2.0 for Deno changelog)
+
+### Deno 2.7.5 highlights
+
+- `deno compile` improvements with npm/jsr package support
+- `deno init --npm vite` scaffolding
+- `deno task` supports `dependencies` field for task ordering
+- `Temporal` API support (behind `--unstable-temporal`)
+- Node.js compatibility improvements (http2, worker_threads, async_hooks)
+- V8 engine upgraded to 14.6
+
 ## v0.2.0 (2026-03-11)
 
 ### Changed
