@@ -25,7 +25,7 @@ Add `tyrex` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:tyrex, "~> 0.1.0"}
+    {:tyrex, "~> 0.2.1"}
   ]
 end
 ```
@@ -349,9 +349,31 @@ Run any example with `TYREX_BUILD=true mix run examples/<file>`:
 | `:timeout` | x | x | GenServer call timeout (default: 5000ms) |
 | `:key` | | x | Dispatch key (for hash strategy) |
 
+## Precompiled Binaries
+
+Tyrex ships precompiled NIFs for these platforms — no Rust toolchain needed:
+
+| Platform | Target |
+|----------|--------|
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+| Linux x86_64 (glibc) | `x86_64-unknown-linux-gnu` |
+| Linux ARM64 (glibc) | `aarch64-unknown-linux-gnu` |
+
+Precompiled binaries require **OTP 27+** (NIF version 2.16).
+
+### Platforms requiring source build
+
+If your platform is not listed above, you'll need to build from source:
+
+- **Linux musl** (Alpine, NixOS)
+- **Windows**
+- **FreeBSD / OpenBSD**
+- **Linux 32-bit, RISC-V, or other architectures**
+
 ## Building from Source
 
-Requires Rust toolchain (1.70+):
+Requires Rust 1.92+ and LLVM 20:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -360,11 +382,16 @@ mix deps.get
 mix compile
 ```
 
-On macOS, the system `libffi` is used automatically. On Linux, install `libffi-dev`:
+> **Note:** The first build takes ~30-60 minutes because V8 is compiled from source.
+
+On macOS, the system `libffi` is used automatically. On Linux, install build dependencies:
 
 ```bash
-sudo apt-get install libffi-dev   # Ubuntu/Debian
-sudo dnf install libffi-devel     # Fedora
+# Ubuntu/Debian
+sudo apt-get install libffi-dev pkg-config libglib2.0-dev
+
+# Fedora
+sudo dnf install libffi-devel
 ```
 
 ## Acknowledgements
