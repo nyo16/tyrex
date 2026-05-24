@@ -2,16 +2,34 @@ defmodule TyrexStrategyTest do
   use ExUnit.Case, async: true
 
   describe "RoundRobin strategy" do
-    test "cycles through indices" do
+    test "cycles through indices starting at 0" do
       state = Tyrex.Pool.Strategy.RoundRobin.init(:test_rr, 3)
 
-      # Should cycle: 1, 2, 0, 1, 2, 0, ...
+      # First select returns 0 (previously was 1 — fixed in 0.3.0).
+      assert Tyrex.Pool.Strategy.RoundRobin.select(state, []) == 0
       assert Tyrex.Pool.Strategy.RoundRobin.select(state, []) == 1
       assert Tyrex.Pool.Strategy.RoundRobin.select(state, []) == 2
       assert Tyrex.Pool.Strategy.RoundRobin.select(state, []) == 0
-      assert Tyrex.Pool.Strategy.RoundRobin.select(state, []) == 1
 
       assert :ok = Tyrex.Pool.Strategy.RoundRobin.terminate(state)
+    end
+
+    test "hits every index exactly once in size consecutive selects" do
+      state = Tyrex.Pool.Strategy.RoundRobin.init(:test_rr_full, 4)
+
+      indices = for _ <- 1..4, do: Tyrex.Pool.Strategy.RoundRobin.select(state, [])
+      assert indices == [0, 1, 2, 3]
+
+      Tyrex.Pool.Strategy.RoundRobin.terminate(state)
+    end
+
+    test "wraps back to 0 after size-1" do
+      state = Tyrex.Pool.Strategy.RoundRobin.init(:test_rr_wrap, 3)
+
+      indices = for _ <- 1..5, do: Tyrex.Pool.Strategy.RoundRobin.select(state, [])
+      assert indices == [0, 1, 2, 0, 1]
+
+      Tyrex.Pool.Strategy.RoundRobin.terminate(state)
     end
 
     test "handles single pool size" do

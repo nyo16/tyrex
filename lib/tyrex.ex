@@ -26,6 +26,14 @@ defmodule Tyrex do
 
       Tyrex.eval(~s|(async () => await Tyrex.apply("Enum", "sum", [[1,2,3]]))()|, pid: pid)
       # => {:ok, 6}
+
+  ## Supervision and error handling
+
+  `Tyrex.start_link/1` follows the standard OTP shape, so a `Tyrex` runtime
+  (and `Tyrex.Pool`) can be added directly to a supervisor's child list.
+  Runtime errors are returned as `{:error, %Tyrex.Error{}}` from the run/eval
+  API; see the **Error handling** section of the README for a full breakdown
+  of the possible `:name` values and how to pattern-match them.
   """
 
   use GenServer
@@ -59,6 +67,9 @@ defmodule Tyrex do
       to start the runtime without a main module.
     * `:permissions` - Runtime permissions. Defaults to `:allow_all`.
       See "Permissions" section below.
+    * `:startup_timeout` - Maximum time in milliseconds to wait for the NIF
+      to acknowledge runtime startup. Defaults to `30_000`. If the NIF does
+      not respond in time, `init/1` returns `{:stop, :nif_startup_timeout}`.
 
   ## Permissions
 
@@ -78,7 +89,7 @@ defmodule Tyrex do
     * `:allow_run` / `:deny_run` — Subprocess execution
     * `:allow_ffi` / `:deny_ffi` — Foreign function interface
     * `:allow_sys` / `:deny_sys` — System info (hostname, OS, etc.)
-    * `:allow_import` — Dynamic imports
+    * `:allow_import` / `:deny_import` — Dynamic ES module imports
 
   ## Examples
 
@@ -144,7 +155,7 @@ defmodule Tyrex do
   def start_link(opts) do
     GenServer.start_link(
       __MODULE__,
-      Keyword.take(opts, [:main_module_path, :permissions]),
+      Keyword.take(opts, [:main_module_path, :permissions, :startup_timeout]),
       name: Keyword.get(opts, :name, __MODULE__)
     )
   end
@@ -200,28 +211,39 @@ defmodule Tyrex do
   end
 
   @doc """
-  Same as `eval/1`, but raises if the result isn't successful.
+  Same as `eval/1`, but raises `Tyrex.Error` if the result isn't successful.
+
+  Use this when you'd rather treat runtime errors as exceptions than handle
+  them in a `case` block. See `Tyrex.Error` for the possible `:name` values.
   """
-  @spec eval!(binary()) :: term()
+  @spec eval!(binary()) :: term() | no_return()
   def eval!(code) do
-    {:ok, result} = eval(code)
-    result
+    case eval(code) do
+      {:ok, result} -> result
+      {:error, %Error{} = e} -> raise e
+    end
   end
 
   @doc """
-  Same as `eval/2`, but raises if the result isn't successful.
+  Same as `eval/2`, but raises `Tyrex.Error` if the result isn't successful.
+
+  Use this when you'd rather treat runtime errors as exceptions than handle
+  them in a `case` block. See `Tyrex.Error` for the possible `:name` values.
   """
-  @spec eval!(binary(), Keyword.t()) :: term()
+  @spec eval!(binary(), Keyword.t()) :: term() | no_return()
   def eval!(code, opts) do
-    {:ok, result} = eval(code, opts)
-    result
+    case eval(code, opts) do
+      {:ok, result} -> result
+      {:error, %Error{} = e} -> raise e
+    end
   end
 
   @impl GenServer
   def init(opts) do
     pid = self()
+    startup_timeout = Keyword.get(opts, :startup_timeout, 30_000)
 
-    result =
+    task =
       Task.async(fn ->
         :ok =
           Native.start_runtime(
@@ -240,9 +262,15 @@ defmodule Tyrex do
 
           error ->
             error
+        after
+          startup_timeout ->
+            {:error, :nif_startup_timeout}
         end
       end)
-      |> Task.await()
+
+    # Give the Task an extra second to return after its inner timeout fires —
+    # otherwise `Task.await` would race the inner `after` clause.
+    result = Task.await(task, startup_timeout + 1_000)
 
     case result do
       {:ok, _} = result ->

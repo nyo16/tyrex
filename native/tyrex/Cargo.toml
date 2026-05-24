@@ -27,4 +27,4 @@ path = "src/lib.rs"
 [package]
 edition = "2021"
 name = "tyrex"
-version = "0.2.0"
+version = "0.3.0"

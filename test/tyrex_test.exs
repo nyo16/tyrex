@@ -25,6 +25,16 @@ defmodule TyrexTest do
     test "start with invalid main_module_path returns error" do
       assert {:error, _} = Tyrex.start(main_module_path: "nonexistent/file.js")
     end
+
+    test "init returns error when startup times out" do
+      # A non-existent main module gives the NIF something to fail on, and a
+      # tiny startup_timeout forces the inner receive's `after` clause to fire
+      # before the NIF can deliver a real error.
+      Process.flag(:trap_exit, true)
+
+      assert {:error, _reason} =
+               Tyrex.start(main_module_path: "/nonexistent/path.js", startup_timeout: 1)
+    end
   end
 
   describe "eval/2 - basic expressions" do
@@ -278,10 +288,22 @@ defmodule TyrexTest do
       assert 42 = Tyrex.eval!("42", pid: pid)
     end
 
-    test "raises on error", %{pid: pid} do
-      assert_raise MatchError, fn ->
-        Tyrex.eval!("throw 'error'", pid: pid)
-      end
+    test "raises Tyrex.Error on JS-side error", %{pid: pid} do
+      err =
+        assert_raise Tyrex.Error, fn ->
+          Tyrex.eval!("throw new Error('boom')", pid: pid)
+        end
+
+      assert err.name == :promise_rejection or err.name == :execution_error
+    end
+
+    test "raises Tyrex.Error on syntax error", %{pid: pid} do
+      err =
+        assert_raise Tyrex.Error, fn ->
+          Tyrex.eval!("this is not js", pid: pid)
+        end
+
+      assert err.name == :execution_error
     end
   end
 

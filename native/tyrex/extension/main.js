@@ -8,6 +8,19 @@ globalThis.Tyrex = {
     Tyrex._applications[applicationId].resolve(result);
     delete Tyrex._applications[applicationId];
   },
+  _applyReply: (applicationId, kind, value) => {
+    const entry = Tyrex._applications[applicationId];
+    if (!entry) {
+      return;
+    }
+    delete Tyrex._applications[applicationId];
+    const parsed = JSON.parse(value);
+    if (kind === "resolve") {
+      entry.resolve(parsed);
+    } else {
+      entry.reject(parsed);
+    }
+  },
   _runtimeId: null,
   apply: (module, functionName, args) => {
     if (typeof module !== "string") {

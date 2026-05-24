@@ -3,15 +3,14 @@
 [![Hex.pm](https://img.shields.io/hexpm/v/tyrex.svg)](https://hex.pm/packages/tyrex)
 [![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/tyrex)
 
-Embedded [Deno](https://deno.com) JavaScript/TypeScript runtime for Elixir via [Rustler](https://github.com/rusterlium/rustler) NIFs.
+Embedded [Deno](https://deno.com) JavaScript runtime for Elixir via [Rustler](https://github.com/rusterlium/rustler) NIFs.
 
-Execute JavaScript and TypeScript directly from Elixir — no external processes, no shelling out. Tyrex embeds the full Deno runtime as a native extension, giving you `fetch`, `Deno.*` APIs, Node.js compatibility, ES modules, and more.
+Execute JavaScript directly from Elixir — no external processes, no shelling out. Tyrex embeds the full Deno runtime as a native extension, giving you `fetch`, `Deno.*` APIs, Node.js compatibility, ES modules, and more.
 
 ## Features
 
 - **Full Deno runtime** — `fetch`, `Deno.readTextFile`, `setTimeout`, Promises, etc.
 - **Inline `~JS` sigil** — Write JavaScript directly in your Elixir code
-- **TypeScript support** — Run `.ts` files as main modules
 - **Bidirectional calls** — Call Elixir functions from JavaScript via `Tyrex.apply()`
 - **Module loading** — Import ES modules with `import`/`export`
 - **Runtime pool** — Pool of Deno runtimes with pluggable dispatch strategies
@@ -56,6 +55,38 @@ mix deps.get && mix compile
 # Stop when done
 Tyrex.stop(pid: pid)
 ```
+
+## Error handling
+
+The `Tyrex.eval/1,2` API returns `{:error, %Tyrex.Error{}}` on failure. The
+error's `:name` field tags what went wrong; `:message` is human-readable and
+`:value` carries any associated payload (e.g. the rejected promise value).
+
+```elixir
+case Tyrex.eval(code, pid: pid) do
+  {:ok, result} ->
+    result
+
+  {:error, %Tyrex.Error{name: :execution_error, message: msg}} ->
+    # JS/TS syntax error or thrown exception during synchronous code
+    Logger.warning("JS execution failed: #{msg}")
+
+  {:error, %Tyrex.Error{name: :promise_rejection, value: reason}} ->
+    # A returned promise rejected; `reason` is the decoded rejection value
+    {:error, {:js_rejected, reason}}
+
+  {:error, %Tyrex.Error{name: :conversion_error, message: msg}} ->
+    # A value could not round-trip between Elixir and JS
+    {:error, {:bad_value, msg}}
+
+  {:error, %Tyrex.Error{name: :dead_runtime_error}} ->
+    # The runtime is gone (crashed or stopped mid-call) — restart and retry
+    {:error, :runtime_down}
+end
+```
+
+For exception-style flow, the `Tyrex.eval!/1,2` (and `Tyrex.Pool.eval!/2,3`)
+variants raise the `Tyrex.Error` directly on failure.
 
 ## Inline `~JS` Sigil
 
@@ -148,7 +179,7 @@ Tyrex.start(permissions: [
 | `allow_run` | `deny_run` | Subprocess execution (`Deno.Command`) |
 | `allow_ffi` | `deny_ffi` | Foreign function interface |
 | `allow_sys` | `deny_sys` | System info (hostname, OS, memory, etc.) |
-| `allow_import` | — | Dynamic ES module imports |
+| `allow_import` | `deny_import` | Dynamic ES module imports |
 
 ### Pool with Permissions
 
@@ -244,6 +275,10 @@ children = [
 {:ok, result} = Tyrex.Pool.eval(:js_pool, "1 + 1")
 ```
 
+`Tyrex.Pool` cleans up its `:persistent_term` entry and any
+strategy-owned ETS tables on supervisor shutdown, so it is safe to start and
+stop pools dynamically (e.g. one pool per tenant) without leaking VM state.
+
 ### Strategies
 
 **Round-Robin** (default) — cycles sequentially, lock-free via ETS atomic counters:
@@ -305,9 +340,12 @@ Run any example with `TYREX_BUILD=true mix run examples/<file>`:
 | Example | Description |
 |---------|-------------|
 | `examples/basic.exs` | Arithmetic, strings, Deno APIs, async, bidirectional calls |
-| `examples/pool.exs` | Round-robin, hash strategy, concurrent eval |
+| `examples/pool.exs` | Round-robin, hash strategy, concurrent runs |
 | `examples/data_processing.exs` | CSV parsing, statistics, URL parsing, HTML sanitization |
+| `examples/error_handling.exs` | Pattern-matching `Tyrex.Error` for execution, rejection, permission, and dead-runtime failures |
+| `examples/least_loaded.exs` | Custom `Tyrex.Pool.Strategy` that routes to the runtime with the shortest mailbox |
 | `examples/phoenix_ssr/ssr_example.exs` | SSR-like template rendering with a pool |
+| `examples/ink_tui/tui_example.exs` | Terminal UI rendering with ANSI colors, tables, and progress bars |
 
 ## API Reference
 
@@ -319,7 +357,7 @@ Run any example with `TYREX_BUILD=true mix run examples/<file>`:
 | `Tyrex.start_link/1` | Start a linked/named runtime (for supervision trees) |
 | `Tyrex.stop/0,1` | Stop a runtime |
 | `Tyrex.eval/1,2` | Evaluate JS, returns `{:ok, result}` or `{:error, %Tyrex.Error{}}` |
-| `Tyrex.eval!/1,2` | Same as `eval`, raises on error |
+| `Tyrex.eval!/1,2` | Same as `eval`, raises `Tyrex.Error` on error |
 
 ### Inline
 
@@ -337,7 +375,7 @@ Run any example with `TYREX_BUILD=true mix run examples/<file>`:
 |----------|-------------|
 | `Tyrex.Pool.start_link/1` | Start a pool supervisor |
 | `Tyrex.Pool.eval/2,3` | Evaluate on a pool-selected runtime |
-| `Tyrex.Pool.eval!/2,3` | Same as `eval`, raises on error |
+| `Tyrex.Pool.eval!/2,3` | Same as `eval`, raises `Tyrex.Error` on error |
 
 ### Options
 

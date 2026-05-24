@@ -63,6 +63,15 @@ defmodule Tyrex.Sigil do
   Use modifier `b` for blocking mode.
   """
   defmacro sigil_JS({:<<>>, _meta, _pieces} = code, modifiers) do
+    case Enum.reject(modifiers, &(&1 == ?b)) do
+      [] ->
+        :ok
+
+      [bad | _] ->
+        raise CompileError,
+          description: "unknown ~JS modifier: '#{<<bad::utf8>>}'. Supported: 'b' (blocking)"
+    end
+
     opts = if ?b in modifiers, do: [blocking: true], else: []
 
     quote do

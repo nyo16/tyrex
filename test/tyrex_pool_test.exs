@@ -1,6 +1,15 @@
 defmodule TyrexPoolTest do
   use ExUnit.Case, async: false
 
+  defp runtime_children(sup) do
+    sup
+    |> Supervisor.which_children()
+    |> Enum.filter(fn
+      {{Tyrex, _i}, _pid, _type, _mods} -> true
+      _ -> false
+    end)
+  end
+
   describe "pool basics" do
     test "start a pool and eval" do
       {:ok, _} = Tyrex.Pool.start_link(name: :basic_pool, size: 2)
@@ -11,15 +20,15 @@ defmodule TyrexPoolTest do
 
     test "pool defaults size to schedulers_online" do
       {:ok, sup} = Tyrex.Pool.start_link(name: :default_size_pool)
-      children = Supervisor.which_children(sup)
-      assert length(children) == System.schedulers_online()
+      runtimes = runtime_children(sup)
+      assert length(runtimes) == System.schedulers_online()
       Supervisor.stop(sup)
     end
 
     test "pool with explicit size" do
       {:ok, sup} = Tyrex.Pool.start_link(name: :sized_pool, size: 3)
-      children = Supervisor.which_children(sup)
-      assert length(children) == 3
+      runtimes = runtime_children(sup)
+      assert length(runtimes) == 3
       Supervisor.stop(sup)
     end
 
@@ -161,6 +170,46 @@ defmodule TyrexPoolTest do
       assert Enum.sort(results) == Enum.map(1..50, &(&1 * 3))
 
       Supervisor.stop(:"conc_pool.Supervisor")
+    end
+  end
+
+  describe "pool cleanup" do
+    test "pool stop erases persistent_term and ETS state" do
+      {:ok, sup} = Tyrex.Pool.start_link(name: :cleanup_pool, size: 2)
+      # Ensure init has completed before sampling state.
+      :sys.get_state(sup)
+
+      assert %{size: 2} = :persistent_term.get({Tyrex.Pool, :cleanup_pool})
+
+      # The default RoundRobin strategy owns an ETS table named after the pool.
+      ets_names_before = :ets.all() |> Enum.map(&:ets.info(&1, :name))
+      assert :"cleanup_pool.RoundRobin" in ets_names_before
+
+      Supervisor.stop(sup)
+      refute Process.alive?(sup)
+
+      assert :persistent_term.get({Tyrex.Pool, :cleanup_pool}, :missing) == :missing
+
+      ets_names_after = :ets.all() |> Enum.map(&:ets.info(&1, :name))
+      refute :"cleanup_pool.RoundRobin" in ets_names_after
+    end
+
+    test "repeated start/stop cycles do not leak persistent_term entries" do
+      base = :persistent_term.info().count
+
+      for i <- 1..5 do
+        name = :"leak_pool_#{i}"
+        {:ok, sup} = Tyrex.Pool.start_link(name: name, size: 1)
+        :sys.get_state(sup)
+        assert %{size: 1} = :persistent_term.get({Tyrex.Pool, name})
+        Supervisor.stop(sup)
+        assert :persistent_term.get({Tyrex.Pool, name}, :missing) == :missing
+      end
+
+      # Count should be unchanged after the cycle (allow a tiny drift for
+      # unrelated entries created by other code in this VM).
+      after_count = :persistent_term.info().count
+      assert after_count - base <= 1
     end
   end
 end

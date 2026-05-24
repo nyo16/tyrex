@@ -142,4 +142,31 @@ defmodule TyrexSigilTest do
       Tyrex.stop(name: :sigil_test_runtime)
     end
   end
+
+  describe "modifier validation" do
+    test "rejects unknown modifiers at compile time" do
+      assert_raise CompileError, ~r/unknown ~JS modifier/, fn ->
+        Code.compile_string(~S|
+          import Tyrex.Sigil
+          ~JS"1+2"x
+        |)
+      end
+    end
+
+    test "accepts the 'b' (blocking) modifier" do
+      # Sanity-check the other side: a known-good modifier compiles cleanly.
+      # We run the compiled form through a runtime to ensure it actually evaluates.
+      {:ok, pid} = Tyrex.start()
+      Tyrex.Inline.set_runtime(pid)
+
+      assert {:ok, 5} =
+               Code.eval_string(~S|
+                 import Tyrex.Sigil
+                 ~JS"2 + 3"b
+               |)
+               |> elem(0)
+
+      Tyrex.stop(pid: pid)
+    end
+  end
 end

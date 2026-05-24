@@ -13,6 +13,9 @@ defmodule Tyrex.Pool.Strategy.Random do
     size
   end
 
+  @doc """
+  Selects a uniformly random runtime index in 0..size-1.
+  """
   @impl true
   def select(size, _opts) do
     :rand.uniform(size) - 1
