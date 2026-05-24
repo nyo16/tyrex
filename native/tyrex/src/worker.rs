@@ -81,14 +81,16 @@ fn build_permissions(
     let parsed: serde_json::Value = match serde_json::from_str(permissions_json) {
         Ok(v) => v,
         Err(_) => {
-            return Ok(deno_runtime::deno_permissions::PermissionsContainer::allow_all(
-                descriptor_parser,
-            ));
+            return Ok(
+                deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser),
+            );
         }
     };
 
     if parsed.is_string() && parsed.as_str() == Some("allow_all") {
-        return Ok(deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser));
+        return Ok(
+            deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser),
+        );
     }
 
     let obj = match parsed.as_object() {
@@ -96,7 +98,9 @@ fn build_permissions(
         None => {
             // Same fallback behavior as before: unexpected JSON shape =>
             // allow_all (callers that want strict perms must pass an object).
-            return Ok(deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser));
+            return Ok(
+                deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser),
+            );
         }
     };
 
@@ -138,13 +142,15 @@ fn build_permissions(
         prompt: false,
     };
 
-    let perms =
-        deno_runtime::deno_permissions::Permissions::from_options(descriptor_parser.as_ref(), &opts)
-            .map_err(|err| Error {
-                message: Some(format!("invalid permissions: {err}")),
-                name: atoms::execution_error(),
-                value: None,
-            })?;
+    let perms = deno_runtime::deno_permissions::Permissions::from_options(
+        descriptor_parser.as_ref(),
+        &opts,
+    )
+    .map_err(|err| Error {
+        message: Some(format!("invalid permissions: {err}")),
+        name: atoms::execution_error(),
+        value: None,
+    })?;
 
     Ok(deno_runtime::deno_permissions::PermissionsContainer::new(
         descriptor_parser,
