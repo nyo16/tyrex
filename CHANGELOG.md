@@ -5,7 +5,7 @@
 ### Added
 
 - New `:startup_timeout` option for `Tyrex.start/1` and `Tyrex.start_link/1`
-  (defaults to 30s); `Tyrex.init/1` now returns
+  (defaults to 30s); the GenServer init callback now returns
   `{:stop, :nif_startup_timeout}` if the NIF does not acknowledge in time.
 - New `examples/error_handling.exs` demonstrating pattern-matching on
   `Tyrex.Error` (`:execution_error`, `:promise_rejection`,
@@ -23,9 +23,9 @@
 - `Tyrex.Pool.Strategy.RoundRobin`'s first selection now returns index `0`
   (previously `1`). The counter is now seeded at `size - 1` so the first
   `update_counter/3` wraps to `0`.
-- `Tyrex.Pool` is now supervised as `:rest_for_one` with a dedicated
-  `Tyrex.Pool.Registry` GenServer that owns the `:persistent_term` entry
-  and the strategy state.
+- `Tyrex.Pool` is now supervised as `:rest_for_one` with a dedicated internal
+  registry GenServer that owns the `:persistent_term` entry and the strategy
+  state so they get cleaned up on supervisor shutdown.
 - Tightened the `mix.exs` package description.
 
 ### Fixed
