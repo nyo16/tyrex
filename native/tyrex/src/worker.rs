@@ -19,13 +19,29 @@ fn op_apply(
     #[string] module: String,
     #[string] function_name: String,
     #[string] args: String,
-) -> () {
+) {
+    // op_apply is reachable from arbitrary JS in the runtime; every input
+    // must be tolerated. Misparses (e.g. someone overwrote `Tyrex._runtimeId`)
+    // are logged and dropped — never panicked on.
+    let parsed_id = match runtime_id.parse::<usize>() {
+        Ok(id) => id,
+        Err(err) => {
+            eprintln!("tyrex: op_apply got invalid runtime_id {runtime_id:?}: {err}");
+            return;
+        }
+    };
+    let slab = runtimes::lock_or_recover();
+    let pid = match slab.get(parsed_id) {
+        Some(pid) => pid,
+        None => {
+            eprintln!(
+                "tyrex: op_apply could not find pid for runtime_id {parsed_id}; dropping reply"
+            );
+            return;
+        }
+    };
     util::send_to_pid(
-        runtimes::get()
-            .lock()
-            .unwrap()
-            .get(runtime_id.parse::<usize>().unwrap())
-            .unwrap(),
+        pid,
         (atoms::apply(), application_id, module, function_name, args),
     );
 }
@@ -55,7 +71,7 @@ fn parse_string_list(value: &serde_json::Value) -> Option<Vec<String>> {
 
 fn build_permissions(
     permissions_json: &str,
-) -> deno_runtime::deno_permissions::PermissionsContainer {
+) -> Result<deno_runtime::deno_permissions::PermissionsContainer, Error> {
     let descriptor_parser = std::sync::Arc::new(
         deno_runtime::permissions::RuntimePermissionDescriptorParser::new(
             sys_traits::impls::RealSys,
@@ -65,59 +81,75 @@ fn build_permissions(
     let parsed: serde_json::Value = match serde_json::from_str(permissions_json) {
         Ok(v) => v,
         Err(_) => {
-            return deno_runtime::deno_permissions::PermissionsContainer::allow_all(
+            return Ok(deno_runtime::deno_permissions::PermissionsContainer::allow_all(
                 descriptor_parser,
-            );
+            ));
         }
     };
 
     if parsed.is_string() && parsed.as_str() == Some("allow_all") {
-        return deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser);
+        return Ok(deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser));
     }
 
-    if !parsed.is_object() {
-        return deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser);
-    }
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => {
+            // Same fallback behavior as before: unexpected JSON shape =>
+            // allow_all (callers that want strict perms must pass an object).
+            return Ok(deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser));
+        }
+    };
 
-    let obj = parsed.as_object().unwrap();
-
-    if obj
+    // `allow_all: true` is a baseline that still honors any `deny_*` overrides
+    // layered on top — documented in the README as `[allow_all: true, deny_X: true]`.
+    // Implemented by defaulting every `allow_*` to `Some(vec![])` (Deno semantics:
+    // empty list = allow all) when allow_all is set, then letting explicit keys
+    // override.
+    let allow_all = obj
         .get("allow_all")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser);
-    }
+        .unwrap_or(false);
+    let allow_default = || if allow_all { Some(vec![]) } else { None };
+    let allow = |key: &str| {
+        obj.get(key)
+            .and_then(parse_string_list)
+            .or_else(allow_default)
+    };
 
     let opts = deno_runtime::deno_permissions::PermissionsOptions {
-        allow_env: obj.get("allow_env").and_then(parse_string_list),
+        allow_env: allow("allow_env"),
         deny_env: obj.get("deny_env").and_then(parse_string_list),
-        allow_net: obj.get("allow_net").and_then(parse_string_list),
+        allow_net: allow("allow_net"),
         deny_net: obj.get("deny_net").and_then(parse_string_list),
-        allow_ffi: obj.get("allow_ffi").and_then(parse_string_list),
+        allow_ffi: allow("allow_ffi"),
         deny_ffi: obj.get("deny_ffi").and_then(parse_string_list),
-        allow_read: obj.get("allow_read").and_then(parse_string_list),
+        allow_read: allow("allow_read"),
         deny_read: obj.get("deny_read").and_then(parse_string_list),
-        allow_run: obj.get("allow_run").and_then(parse_string_list),
+        allow_run: allow("allow_run"),
         deny_run: obj.get("deny_run").and_then(parse_string_list),
-        allow_sys: obj.get("allow_sys").and_then(parse_string_list),
+        allow_sys: allow("allow_sys"),
         deny_sys: obj.get("deny_sys").and_then(parse_string_list),
-        allow_write: obj.get("allow_write").and_then(parse_string_list),
+        allow_write: allow("allow_write"),
         deny_write: obj.get("deny_write").and_then(parse_string_list),
-        allow_import: obj.get("allow_import").and_then(parse_string_list),
+        allow_import: allow("allow_import"),
         deny_import: obj.get("deny_import").and_then(parse_string_list),
         ignore_env: None,
         ignore_read: None,
         prompt: false,
     };
 
-    let perms = deno_runtime::deno_permissions::Permissions::from_options(
-        descriptor_parser.as_ref(),
-        &opts,
-    )
-    .unwrap();
+    let perms =
+        deno_runtime::deno_permissions::Permissions::from_options(descriptor_parser.as_ref(), &opts)
+            .map_err(|err| Error {
+                message: Some(format!("invalid permissions: {err}")),
+                name: atoms::execution_error(),
+                value: None,
+            })?;
 
-    deno_runtime::deno_permissions::PermissionsContainer::new(descriptor_parser, perms)
+    Ok(deno_runtime::deno_permissions::PermissionsContainer::new(
+        descriptor_parser,
+        perms,
+    ))
 }
 
 pub async fn new(
@@ -126,9 +158,21 @@ pub async fn new(
     permissions_json: String,
 ) -> Result<MainWorker, Error> {
     let _ = deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let path = std::env::current_dir().unwrap().join(main_module_path);
-    let main_module = deno_core::ModuleSpecifier::from_file_path(path).unwrap();
-    let permissions = build_permissions(&permissions_json);
+    let cwd = std::env::current_dir().map_err(|err| Error {
+        message: Some(format!("could not get current dir: {err}")),
+        name: atoms::execution_error(),
+        value: None,
+    })?;
+    let path = cwd.join(main_module_path);
+    let main_module = deno_core::ModuleSpecifier::from_file_path(&path).map_err(|_| Error {
+        message: Some(format!(
+            "could not build module specifier from path: {}",
+            path.display()
+        )),
+        name: atoms::execution_error(),
+        value: None,
+    })?;
+    let permissions = build_permissions(&permissions_json)?;
     let mut worker = MainWorker::bootstrap_from_options(
         &main_module,
         deno_runtime::worker::WorkerServiceOptions::<
@@ -160,11 +204,15 @@ pub async fn new(
     worker
         .execute_script(
             "<anon>",
-            format!("Tyrex._runtimeId = \"{}\"", runtime_id.to_string())
+            format!("Tyrex._runtimeId = \"{}\"", runtime_id)
                 .to_string()
                 .into(),
         )
-        .unwrap();
+        .map_err(|err| Error {
+            message: Some(format!("could not seed Tyrex._runtimeId: {err}")),
+            name: atoms::execution_error(),
+            value: None,
+        })?;
     worker
         .execute_main_module(&main_module)
         .await
@@ -176,12 +224,33 @@ pub async fn new(
     Ok(worker)
 }
 
+type PromiseSlab = slab::Slab<(
+    deno_core::v8::Global<deno_core::v8::Value>,
+    Sender<Result<String, Error>>,
+)>;
+
+/// Send a `dead_runtime_error` to every pending promise's response sender, so
+/// callers waiting on `Tyrex.eval` get an immediate error instead of hanging
+/// until their GenServer timeout fires.
+fn drain_pending_promises(promises: &mut PromiseSlab) {
+    let drained = std::mem::take(promises);
+    for (_, (_global, response_sender)) in drained {
+        let _ = response_sender
+            .send(Err(Error {
+                message: None,
+                name: atoms::dead_runtime_error(),
+                value: None,
+            }))
+            .ok();
+    }
+}
+
 pub async fn run(
     runtime_id: usize,
     mut worker: MainWorker,
     mut worker_receiver: tokio::sync::mpsc::UnboundedReceiver<Message>,
 ) {
-    let mut promises = slab::Slab::new();
+    let mut promises: PromiseSlab = slab::Slab::new();
     let mut poll_event_loop = true;
     loop {
         tokio::select! {
@@ -189,39 +258,70 @@ pub async fn run(
                 match message {
                     Message::Stop(response_sender) => {
                         worker_receiver.close();
-                        response_sender.send(()).unwrap();
-                        runtimes::get().lock().unwrap().remove(runtime_id);
+                        // Stop's ack is shutdown synchronization, not caller data.
+                        // The Drop impl on `Runtime` sends a fire-and-forget Stop
+                        // whose oneshot receiver is dropped immediately, so this
+                        // send routinely fails on benign teardown. Silently OK.
+                        let _ = response_sender.send(());
+                        runtimes::lock_or_recover().try_remove(runtime_id);
+                        drain_pending_promises(&mut promises);
                         break;
                     },
                     Message::ApplyReply(application_id, result) => {
-                        let (function, value) = match result {
-                            Ok(value) => { ("resolve", value) },
-                            Err(value) => { ("reject", value) }
+                        let (kind, value) = match result {
+                            Ok(value) => ("resolve", value),
+                            Err(value) => ("reject", value),
                         };
-                        worker.execute_script(
-                            "<anon>",
-                            format!("Tyrex._applications[\"{application_id}\"].{function}({value})").to_string().into()
-                        ).unwrap();
+                        // Avoid string-format injection by building each argument
+                        // as a properly JSON-encoded literal that the JS bridge
+                        // will JSON.parse internally.
+                        let script = match (
+                            serde_json::to_string(&application_id),
+                            serde_json::to_string(kind),
+                            serde_json::to_string(&value),
+                        ) {
+                            (Ok(id_lit), Ok(kind_lit), Ok(value_lit)) => {
+                                format!(
+                                    "globalThis.Tyrex._applyReply({id_lit}, {kind_lit}, {value_lit})"
+                                )
+                            }
+                            _ => {
+                                eprintln!(
+                                    "tyrex: could not serialize ApplyReply payload for runtime {runtime_id}"
+                                );
+                                continue;
+                            }
+                        };
+                        if let Err(err) = worker.execute_script("<anon>", script.into()) {
+                            eprintln!(
+                                "tyrex: Tyrex._applyReply execute_script failed on runtime {runtime_id}: {err}"
+                            );
+                        }
                         poll_event_loop = true;
                     },
                     Message::Eval(code, response_sender) => {
                         match worker.execute_script("<anon>", code.into()) {
                             Ok(global) => {
-                                if {
+                                let is_promise = {
                                     deno_core::scope!(scope, worker.js_runtime);
                                     let local = deno_core::v8::Local::new(scope, &global);
                                     local.is_promise()
-                                } {
+                                };
+                                if is_promise {
                                     promises.insert((global, response_sender));
                                 } else {
                                     deno_core::scope!(scope, worker.js_runtime);
                                     let local = deno_core::v8::Local::new(scope, &global);
                                     match serde_v8::from_v8::<serde_json::Value>(scope, local) {
                                         Ok(value) => {
-                                            response_sender.send(Ok(value.to_string())).unwrap();
+                                            if response_sender.send(Ok(value.to_string())).is_err() {
+                                                eprintln!(
+                                                    "tyrex: lost reply for Eval result on runtime {runtime_id}"
+                                                );
+                                            }
                                         },
                                         Err(_) => {
-                                            response_sender.send(
+                                            if response_sender.send(
                                                 Err(
                                                     Error {
                                                         message: None,
@@ -229,13 +329,17 @@ pub async fn run(
                                                         value: None
                                                     }
                                                 )
-                                            ).unwrap();
+                                            ).is_err() {
+                                                eprintln!(
+                                                    "tyrex: lost reply for Eval conversion-error on runtime {runtime_id}"
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             },
                             Err(error) => {
-                                response_sender.send(
+                                if response_sender.send(
                                     Err(
                                         Error {
                                             message: Some(error.to_string()),
@@ -243,17 +347,23 @@ pub async fn run(
                                             value: None
                                         }
                                     )
-                                ).unwrap();
+                                ).is_err() {
+                                    eprintln!(
+                                        "tyrex: lost reply for Eval execution-error on runtime {runtime_id}"
+                                    );
+                                }
                             }
                         };
                         poll_event_loop = true;
                     }
                 }
             },
-            _ = run_event_loop(&mut worker, &mut promises), if poll_event_loop => {
+            _ = run_event_loop(&mut worker, &mut promises, runtime_id), if poll_event_loop => {
                 poll_event_loop = false;
             },
             else => {
+                runtimes::lock_or_recover().try_remove(runtime_id);
+                drain_pending_promises(&mut promises);
                 break;
             }
         }
@@ -262,10 +372,8 @@ pub async fn run(
 
 async fn run_event_loop(
     worker: &mut MainWorker,
-    promises: &mut slab::Slab<(
-        deno_core::v8::Global<deno_core::v8::Value>,
-        Sender<Result<String, Error>>,
-    )>,
+    promises: &mut PromiseSlab,
+    runtime_id: usize,
 ) -> Result<(), deno_core::error::CoreError> {
     std::future::poll_fn(|cx| {
         let poll = worker.js_runtime.poll_event_loop(cx, Default::default());
@@ -274,8 +382,15 @@ async fn run_event_loop(
             .iter()
             .filter_map(|(key, (global, _))| {
                 let local = deno_core::v8::Local::new(scope, global);
-                let promise =
-                    deno_core::v8::Local::<deno_core::v8::Promise>::try_from(local).unwrap();
+                let promise = match deno_core::v8::Local::<deno_core::v8::Promise>::try_from(local) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!(
+                            "tyrex: stored promise on runtime {runtime_id} was not a Promise; skipping"
+                        );
+                        return None;
+                    }
+                };
                 if matches!(
                     promise.state(),
                     deno_core::v8::PromiseState::Fulfilled | deno_core::v8::PromiseState::Rejected
@@ -289,34 +404,54 @@ async fn run_event_loop(
         for promise_key in resolved_promises {
             let (global, response_sender) = promises.remove(promise_key);
             let local = deno_core::v8::Local::new(scope, global);
-            let promise = deno_core::v8::Local::<deno_core::v8::Promise>::try_from(local).unwrap();
+            let promise = match deno_core::v8::Local::<deno_core::v8::Promise>::try_from(local) {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!(
+                        "tyrex: resolved entry on runtime {runtime_id} was not a Promise; skipping reply"
+                    );
+                    continue;
+                }
+            };
             let result = promise.result(scope);
             match serde_v8::from_v8::<serde_json::Value>(scope, result) {
                 Ok(value) => {
                     if promise.state() == deno_core::v8::PromiseState::Fulfilled {
-                        response_sender.send(Ok(value.to_string())).unwrap();
-                    } else {
-                        response_sender
-                            .send(Err(Error {
-                                message: None,
-                                name: atoms::promise_rejection(),
-                                value: Some(value.to_string()),
-                            }))
-                            .unwrap();
+                        if response_sender.send(Ok(value.to_string())).is_err() {
+                            eprintln!(
+                                "tyrex: lost reply for promise-resolve on runtime {runtime_id}"
+                            );
+                        }
+                    } else if response_sender
+                        .send(Err(Error {
+                            message: None,
+                            name: atoms::promise_rejection(),
+                            value: Some(value.to_string()),
+                        }))
+                        .is_err()
+                    {
+                        eprintln!(
+                            "tyrex: lost reply for promise-rejection on runtime {runtime_id}"
+                        );
                     }
                 }
                 Err(_) => {
-                    response_sender
+                    if response_sender
                         .send(Err(Error {
                             message: None,
                             name: atoms::conversion_error(),
                             value: None,
                         }))
-                        .unwrap();
+                        .is_err()
+                    {
+                        eprintln!(
+                            "tyrex: lost reply for promise conversion-error on runtime {runtime_id}"
+                        );
+                    }
                 }
             }
         }
-        return poll;
+        poll
     })
     .await
 }

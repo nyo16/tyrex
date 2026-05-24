@@ -105,6 +105,24 @@ defmodule TyrexPermissionsTest do
 
       Tyrex.stop(pid: pid)
     end
+
+    test "deny_import blocks dynamic ES module imports" do
+      {:ok, pid} = Tyrex.start(permissions: [allow_all: true, deny_import: true])
+
+      # Use an https: URL — Deno checks the import permission *before* any
+      # network call, so this never escapes the sandbox.
+      result =
+        Tyrex.eval(
+          "(async () => await import('https://deno.land/std@0.224.0/uuid/mod.ts'))()",
+          pid: pid
+        )
+
+      assert {:error, %Tyrex.Error{} = err} = result
+      # Permission denials are surfaced as promise rejections by the JS runtime.
+      assert err.name in [:promise_rejection, :execution_error]
+
+      Tyrex.stop(pid: pid)
+    end
   end
 
   describe "pool with permissions" do

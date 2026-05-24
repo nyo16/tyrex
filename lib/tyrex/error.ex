@@ -3,7 +3,14 @@ defmodule Tyrex.Error do
   Exception struct for Tyrex runtime errors.
 
   Fields:
-    * `:name` - Error type atom (e.g., `:execution_error`, `:promise_rejection`, `:dead_runtime_error`)
+    * `:name` - Error type atom. One of:
+      * `:execution_error` — JS/TS code raised or failed to compile
+      * `:promise_rejection` — Returned promise rejected; `:value` holds the
+        decoded rejection value
+      * `:conversion_error` — A value could not be converted between Elixir
+        and JavaScript representations
+      * `:dead_runtime_error` — The underlying runtime is no longer alive
+        (e.g. crashed or was stopped while a call was in flight)
     * `:message` - Human-readable error message (optional)
     * `:value` - Additional error value, such as the rejected promise value (optional)
   """
@@ -12,10 +19,25 @@ defmodule Tyrex.Error do
     :name
   ]
 
-  @type t :: %__MODULE__{}
+  @typedoc """
+  A `Tyrex.Error` exception with a tagged `:name`, optional human-readable
+  `:message`, and an optional `:value` payload (used for promise rejections).
+  """
+  @type t :: %__MODULE__{
+          name: atom(),
+          message: String.t() | nil,
+          value: term() | nil
+        }
 
   defexception [:message, :name, :value]
 
+  @doc """
+  Build a `Tyrex.Error` exception from a keyword list.
+
+  Required: `:name`. Optional: `:message`, `:value`. This is the callback
+  used by `raise Tyrex.Error, name: :dead_runtime_error` and similar.
+  """
+  @spec exception(Keyword.t()) :: t()
   def exception(opts) do
     %__MODULE__{
       message: Keyword.get(opts, :message),
@@ -24,6 +46,11 @@ defmodule Tyrex.Error do
     }
   end
 
+  @doc """
+  Format a `Tyrex.Error` as a human-readable string. Used by Elixir when
+  the exception is raised or inspected via `Exception.message/1`.
+  """
+  @spec message(t()) :: String.t()
   def message(error) do
     if error.message do
       "#{error.name}: #{error.message}"

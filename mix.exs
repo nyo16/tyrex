@@ -1,7 +1,7 @@
 defmodule Tyrex.MixProject do
   use Mix.Project
 
-  @version "0.2.1"
+  @version "0.3.0"
   @source_url "https://github.com/nyo16/tyrex"
 
   def project do
@@ -28,8 +28,7 @@ defmodule Tyrex.MixProject do
 
   defp description do
     "Embedded Deno JS/TS runtime for Elixir via Rustler NIFs. " <>
-      "Execute JavaScript and TypeScript from Elixir with full Deno API support, " <>
-      "bidirectional Elixir<->JS calls, and a pooled runtime system."
+      "Bidirectional Elixir<->JS calls and a pooled runtime."
   end
 
   defp package do

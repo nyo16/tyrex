@@ -9,7 +9,7 @@ mod worker;
 use rustler::Env;
 use rustler::ResourceArc;
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn start_runtime(
     env: Env,
     pid: rustler::LocalPid,
@@ -17,31 +17,49 @@ fn start_runtime(
     permissions_json: String,
 ) -> rustler::Atom {
     let task_pid = env.pid();
-    let runtime_id = runtimes::get().lock().unwrap().insert(pid);
+    let runtime_id = runtimes::lock_or_recover().insert(pid);
     let (worker_sender, worker_receiver) =
         tokio::sync::mpsc::unbounded_channel::<worker::Message>();
     std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
+        let tokio_rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
-            .block_on(async {
-                match worker::new(runtime_id, main_module_path, permissions_json).await {
-                    Ok(worker) => {
-                        util::send_to_pid(
-                            &task_pid,
-                            (
-                                atoms::ok(),
-                                ResourceArc::new(runtime::Runtime { worker_sender }),
-                            ),
-                        );
-                        worker::run(runtime_id, worker, worker_receiver).await;
-                    }
-                    Err(message) => {
-                        util::send_to_pid(&task_pid, (atoms::error(), message));
-                    }
+        {
+            Ok(rt) => rt,
+            Err(build_err) => {
+                util::send_to_pid(
+                    &task_pid,
+                    (
+                        atoms::error(),
+                        error::Error {
+                            message: Some(format!("tokio runtime build failed: {build_err}")),
+                            name: atoms::execution_error(),
+                            value: None,
+                        },
+                    ),
+                );
+                runtimes::lock_or_recover().try_remove(runtime_id);
+                return;
+            }
+        };
+        tokio_rt.block_on(async {
+            match worker::new(runtime_id, main_module_path, permissions_json).await {
+                Ok(worker) => {
+                    util::send_to_pid(
+                        &task_pid,
+                        (
+                            atoms::ok(),
+                            ResourceArc::new(runtime::Runtime { worker_sender }),
+                        ),
+                    );
+                    worker::run(runtime_id, worker, worker_receiver).await;
                 }
-            });
+                Err(message) => {
+                    util::send_to_pid(&task_pid, (atoms::error(), message));
+                    runtimes::lock_or_recover().try_remove(runtime_id);
+                }
+            }
+        });
     });
     atoms::ok()
 }
@@ -56,7 +74,9 @@ fn stop_runtime(env: Env, resource: ResourceArc<runtime::Runtime>) -> rustler::A
             .send(worker::Message::Stop(response_sender))
             .is_ok()
         {
-            response_receiver.await.unwrap();
+            // If the worker dies before acking, treat the stop as successful
+            // — the worker is gone either way, which is what the caller wants.
+            let _ = response_receiver.await.ok();
             util::send_to_pid(&pid, atoms::ok());
         } else {
             util::send_to_pid(
@@ -114,7 +134,7 @@ fn eval(
     atoms::ok()
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn eval_blocking(
     resource: ResourceArc<runtime::Runtime>,
     code: String,
