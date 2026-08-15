@@ -199,7 +199,7 @@ defmodule TyrexTest do
 
   describe "eval/2 - Deno APIs" do
     setup do
-      {:ok, pid} = Tyrex.start()
+      {:ok, pid} = Tyrex.start(permissions: :allow_all)
       on_exit(fn -> Tyrex.stop(pid: pid) end)
       %{pid: pid}
     end
@@ -344,7 +344,16 @@ defmodule TyrexTest do
 
   describe "bidirectional - Tyrex.apply (JS -> Elixir)" do
     setup do
-      {:ok, pid} = Tyrex.start()
+      {:ok, pid} =
+        Tyrex.start(
+          apply: [
+            {Enum, :sum, 1},
+            {Enum, :reverse, 1},
+            {String, :upcase, 1},
+            {:erlang, :length, 1}
+          ]
+        )
+
       on_exit(fn -> Tyrex.stop(pid: pid) end)
       %{pid: pid}
     end

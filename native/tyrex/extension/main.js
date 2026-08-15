@@ -21,7 +21,6 @@ globalThis.Tyrex = {
       entry.reject(parsed);
     }
   },
-  _runtimeId: null,
   apply: (module, functionName, args) => {
     if (typeof module !== "string") {
       throw new Error(`Not a string: ${module}`);
@@ -36,7 +35,7 @@ globalThis.Tyrex = {
     const promise = new Promise((resolve, reject) => {
       Tyrex._applications[applicationId] = {reject, resolve};
     });
-    op_apply(Tyrex._runtimeId, applicationId, module, functionName, JSON.stringify(args));
+    op_apply(applicationId, module, functionName, JSON.stringify(args));
     return promise;
   },
 };

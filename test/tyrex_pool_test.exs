@@ -154,6 +154,75 @@ defmodule TyrexPoolTest do
     end
   end
 
+  # `Tyrex.Pool.init/1` re-lists the options it hands to each child, so a
+  # runtime option can exist on `Tyrex.start_link/1` and never reach a pooled
+  # runtime — `:apply` and `:max_heap_mb` were dropped exactly that way until
+  # v0.4.0, and a pooled runtime has no other route to a heap cap.
+  describe "pool option forwarding" do
+    test ":apply reaches every runtime in the pool" do
+      {:ok, _} = Tyrex.Pool.start_link(name: :apply_pool, size: 2, apply: [{Enum, :sum, 1}])
+
+      # Round-robin, so two calls exercise both children: the allowlist has to
+      # have reached each of them, not just the one the first eval landed on.
+      for _ <- 1..2 do
+        assert {:ok, 6} =
+                 Tyrex.Pool.eval(
+                   :apply_pool,
+                   ~s|(async () => await Tyrex.apply("Enum", "sum", [[1,2,3]]))()|
+                 )
+      end
+
+      # And the allowlist travelled, not merely the bridge: an MFA outside it is
+      # refused by the runtime that received the list.
+      assert {:error, %Tyrex.Error{name: :promise_rejection, value: value}} =
+               Tyrex.Pool.eval(
+                 :apply_pool,
+                 ~s|(async () => await Tyrex.apply("File", "read!", ["mix.exs"]))()|
+               )
+
+      assert value =~ "permission_denied"
+
+      Supervisor.stop(:"apply_pool.Supervisor")
+    end
+
+    test "a pool started without :apply has no bridge in its runtimes" do
+      {:ok, _} = Tyrex.Pool.start_link(name: :no_apply_pool, size: 2)
+
+      # The negative case that makes the positive one mean something: without
+      # `:apply` the bootstrap deletes the global, so a bridge observed above
+      # can only have come from the forwarded allowlist.
+      for _ <- 1..2 do
+        assert {:ok, "undefined"} = Tyrex.Pool.eval(:no_apply_pool, "typeof globalThis.Tyrex")
+      end
+
+      Supervisor.stop(:"no_apply_pool.Supervisor")
+    end
+
+    @tag timeout: 120_000
+    test ":max_heap_mb reaches a pooled runtime and caps it" do
+      {:ok, sup} =
+        Tyrex.Pool.start_link(
+          name: :heap_pool,
+          size: 1,
+          permissions: :none,
+          max_heap_mb: 64
+        )
+
+      code = """
+      const chunks = [];
+      for (;;) { chunks.push(new Array(1_000_000).fill(7)); }
+      """
+
+      # Pinned by equality. If the cap never reached the child the guest just
+      # allocates until the eval deadline and reports `:timeout`, which would
+      # leave this green over a pool whose runtimes have no heap limit at all.
+      assert {:error, %Tyrex.Error{name: :heap_limit_error}} =
+               Tyrex.Pool.eval(:heap_pool, code, timeout: 30_000)
+
+      Supervisor.stop(sup)
+    end
+  end
+
   describe "pool concurrency" do
     test "handles concurrent requests" do
       {:ok, _} = Tyrex.Pool.start_link(name: :conc_pool, size: 4)

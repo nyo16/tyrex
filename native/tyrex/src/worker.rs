@@ -2,7 +2,9 @@ use crate::atoms;
 use crate::error::Error;
 use crate::runtimes;
 use crate::util;
+use deno_core::error::ModuleLoaderError;
 use deno_core::op2;
+use deno_core::OpState;
 use deno_runtime::worker::MainWorker;
 use tokio::sync::oneshot::Sender;
 
@@ -12,30 +14,33 @@ pub enum Message {
     Stop(Sender<()>),
 }
 
+/// The runtime's slab id, kept in per-runtime `OpState`.
+///
+/// It used to travel from JS as `Tyrex._runtimeId`, which made it a
+/// guest-writable choice of *which* runtime's GenServer authorizes an `:apply`
+/// call. Since the allowlist is per-runtime, a guest that overwrote it could
+/// have its call authorized against a sibling runtime's allowlist. `OpState` is
+/// per-runtime and unreachable from JavaScript, so the id is no longer input.
+struct RuntimeId(usize);
+
 #[op2(fast)]
 fn op_apply(
-    #[string] runtime_id: String,
+    state: &mut OpState,
     #[string] application_id: String,
     #[string] module: String,
     #[string] function_name: String,
     #[string] args: String,
 ) {
-    // op_apply is reachable from arbitrary JS in the runtime; every input
-    // must be tolerated. Misparses (e.g. someone overwrote `Tyrex._runtimeId`)
-    // are logged and dropped — never panicked on.
-    let parsed_id = match runtime_id.parse::<usize>() {
-        Ok(id) => id,
-        Err(err) => {
-            eprintln!("tyrex: op_apply got invalid runtime_id {runtime_id:?}: {err}");
-            return;
-        }
-    };
+    let runtime_id = state.borrow::<RuntimeId>().0;
     let slab = runtimes::lock_or_recover();
-    let pid = match slab.get(parsed_id) {
+    // op_apply is reachable from arbitrary JS in the runtime; every input must
+    // be tolerated. A missing pid means the runtime is being torn down, which
+    // is logged and dropped — never panicked on.
+    let pid = match slab.get(runtime_id) {
         Some(pid) => pid,
         None => {
             eprintln!(
-                "tyrex: op_apply could not find pid for runtime_id {parsed_id}; dropping reply"
+                "tyrex: op_apply could not find pid for runtime_id {runtime_id}; dropping reply"
             );
             return;
         }
@@ -51,21 +56,195 @@ deno_core::extension!(
     ops = [op_apply],
     esm_entry_point = "ext:extension/main.js",
     esm = [dir "extension", "main.js"],
-    state = |state| {
+    options = { runtime_id: usize },
+    state = |state, options| {
         state.put(deno_runtime::ops::bootstrap::SnapshotOptions::default());
+        state.put(RuntimeId(options.runtime_id));
     }
 );
 
-fn parse_string_list(value: &serde_json::Value) -> Option<Vec<String>> {
+/// `FsModuleLoader` receives no `PermissionsContainer` and ends in a bare
+/// `std::fs::read`, so before this wrapper `import()` read any file the BEAM
+/// user could read under *any* permission set: `permissions: :none` denied
+/// `Deno.readTextFileSync` while
+/// `import("file:///etc/passwd", {with: {type: "json"}})` returned the parsed
+/// contents, and `deny_import` was inert.
+///
+/// The check is `PermissionsContainer::check_specifier`, which is what deno
+/// itself uses: a `file:` specifier is checked against *read* permissions, and
+/// any other scheme against `allow_import`/`deny_import`.
+///
+/// Static loads are exempt, and deliberately so. `ModuleLoadOptions::is_dynamic_import`
+/// is a property of the whole load — `RecursiveModuleLoad` derives it from
+/// `LoadInit`, so a dynamic `import()` propagates it to every transitive
+/// dependency — which makes it exactly the operator/guest boundary: the main
+/// module named by `:main_module_path` and its static import graph are
+/// operator-supplied and loaded once at bootstrap, whereas `import()` from
+/// eval'd code is guest-supplied. Enforcing on static loads too would break
+/// `Tyrex.start(permissions: :none, main_module_path: ...)`, which is the
+/// documented way to give a locked-down runtime its code.
+struct PermissionedModuleLoader {
+    inner: deno_core::FsModuleLoader,
+    permissions: deno_runtime::deno_permissions::PermissionsContainer,
+}
+
+impl PermissionedModuleLoader {
+    fn check_dynamic(
+        &self,
+        specifier: &deno_core::ModuleSpecifier,
+    ) -> Result<(), ModuleLoaderError> {
+        self.permissions
+            .check_specifier(
+                specifier,
+                deno_runtime::deno_permissions::CheckSpecifierKind::Dynamic,
+            )
+            .map_err(|err| ModuleLoaderError::generic(err.to_string()))
+    }
+}
+
+impl deno_core::ModuleLoader for PermissionedModuleLoader {
+    /// Checked here as well as in `load`, and both are load-bearing.
+    ///
+    /// `ModuleMap::load_dynamic_import` resolves *before* it consults the module
+    /// map, so this is the only hook that sees an `import()` of an
+    /// already-loaded specifier. Without it, a guest could re-import the main
+    /// module's own static graph — no `load`, no read, no check — and the
+    /// exemption for operator-supplied code would quietly extend to anything
+    /// the operator had ever imported.
+    fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        kind: deno_core::ResolutionKind,
+    ) -> Result<deno_core::ModuleSpecifier, ModuleLoaderError> {
+        let is_dynamic = kind == deno_core::ResolutionKind::DynamicImport;
+        let resolved = self.inner.resolve(specifier, referrer, kind)?;
+
+        if is_dynamic {
+            self.check_dynamic(&resolved)?;
+        }
+
+        Ok(resolved)
+    }
+
+    /// `import.meta.resolve` is pure URL arithmetic — it reads nothing — so it
+    /// keeps the unchecked path even though its default implementation would
+    /// route through `resolve` with `DynamicImport`.
+    fn import_meta_resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<deno_core::ModuleSpecifier, ModuleLoaderError> {
+        self.inner.import_meta_resolve(specifier, referrer)
+    }
+
+    /// The check that guards the actual `std::fs::read`. `resolve` already
+    /// rejected the specifier, but a loader whose only check lives in `resolve`
+    /// is one refactor away from reading files again.
+    fn load(
+        &self,
+        module_specifier: &deno_core::ModuleSpecifier,
+        maybe_referrer: Option<&deno_core::ModuleLoadReferrer>,
+        options: deno_core::ModuleLoadOptions,
+    ) -> deno_core::ModuleLoadResponse {
+        if options.is_dynamic_import {
+            if let Err(err) = self.check_dynamic(module_specifier) {
+                return deno_core::ModuleLoadResponse::Sync(Err(err));
+            }
+        }
+
+        self.inner.load(module_specifier, maybe_referrer, options)
+    }
+}
+
+/// Every permission key tyrex understands. Anything else is a typo, and a typo
+/// in a security control must not be silently ignored: `[deny_nett: true]`
+/// previously produced a fully permissive runtime that reported success.
+const PERMISSION_KEYS: &[&str] = &[
+    "allow_all",
+    "allow_env",
+    "deny_env",
+    "allow_net",
+    "deny_net",
+    "allow_ffi",
+    "deny_ffi",
+    "allow_read",
+    "deny_read",
+    "allow_run",
+    "deny_run",
+    "allow_sys",
+    "deny_sys",
+    "allow_write",
+    "deny_write",
+    "allow_import",
+    "deny_import",
+];
+
+fn permissions_error(message: String) -> Error {
+    Error {
+        message: Some(message),
+        name: atoms::execution_error(),
+        value: None,
+    }
+}
+
+/// The three shapes a permission value may take. Kept direction-neutral,
+/// because the same literal means opposite things for `allow_*` and `deny_*`:
+/// an empty list allows nothing but denies nothing.
+enum PermValue {
+    True,
+    False,
+    List(Vec<String>),
+}
+
+fn parse_perm_value(key: &str, value: &serde_json::Value) -> Result<PermValue, Error> {
     match value {
-        serde_json::Value::Bool(true) => Some(vec![]),
-        serde_json::Value::Bool(false) => None,
-        serde_json::Value::Array(arr) => Some(
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-        ),
-        _ => None,
+        serde_json::Value::Bool(true) => Ok(PermValue::True),
+        serde_json::Value::Bool(false) => Ok(PermValue::False),
+        serde_json::Value::Array(arr) => {
+            let mut items = Vec::with_capacity(arr.len());
+            for (index, item) in arr.iter().enumerate() {
+                match item.as_str() {
+                    // Silently dropping a non-string entry would quietly widen
+                    // the grant, so refuse the whole runtime instead.
+                    Some(s) => items.push(s.to_string()),
+                    None => {
+                        return Err(permissions_error(format!(
+                            "permission {key}[{index}] must be a string, got {item}"
+                        )))
+                    }
+                }
+            }
+            Ok(PermValue::List(items))
+        }
+        other => Err(permissions_error(format!(
+            "permission {key} must be true, false, or a list of strings, got {other}"
+        ))),
+    }
+}
+
+/// Deno encodes an `allow_*` grant as `Option<Vec<String>>`, where `None` is
+/// "not granted" and `Some(vec![])` is "granted without restriction".
+fn allow_option(value: PermValue) -> Option<Vec<String>> {
+    match value {
+        PermValue::True => Some(vec![]),
+        PermValue::False => None,
+        // An empty allowlist grants zero paths/hosts/vars. Mapping it to
+        // `Some(vec![])` — as the previous code did — inverted it into a grant
+        // over everything, so `allow_read: []` handed out the whole filesystem.
+        PermValue::List(list) if list.is_empty() => None,
+        PermValue::List(list) => Some(list),
+    }
+}
+
+/// For `deny_*` the polarity flips: `Some(vec![])` denies everything and an
+/// empty list denies nothing.
+fn deny_option(value: PermValue) -> Option<Vec<String>> {
+    match value {
+        PermValue::True => Some(vec![]),
+        PermValue::False => None,
+        PermValue::List(list) if list.is_empty() => None,
+        PermValue::List(list) => Some(list),
     }
 }
 
@@ -78,65 +257,93 @@ fn build_permissions(
         ),
     );
 
-    let parsed: serde_json::Value = match serde_json::from_str(permissions_json) {
-        Ok(v) => v,
-        Err(_) => {
-            return Ok(
-                deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser),
-            );
-        }
-    };
+    // Every failure below returns Err. A sandbox that cannot understand its own
+    // configuration must refuse to start; the previous code fell back to
+    // `allow_all`, so a malformed payload silently produced the most privileged
+    // runtime available while still reporting success.
+    let parsed: serde_json::Value = serde_json::from_str(permissions_json)
+        .map_err(|err| permissions_error(format!("permissions are not valid JSON: {err}")))?;
 
-    if parsed.is_string() && parsed.as_str() == Some("allow_all") {
-        return Ok(
-            deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser),
-        );
+    if let Some(name) = parsed.as_str() {
+        return if name == "allow_all" {
+            Ok(deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser))
+        } else {
+            Err(permissions_error(format!(
+                "unknown permissions preset {name:?}, expected \"allow_all\""
+            )))
+        };
     }
 
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => {
-            // Same fallback behavior as before: unexpected JSON shape =>
-            // allow_all (callers that want strict perms must pass an object).
-            return Ok(
-                deno_runtime::deno_permissions::PermissionsContainer::allow_all(descriptor_parser),
-            );
+    let obj = parsed.as_object().ok_or_else(|| {
+        permissions_error(format!(
+            "permissions must be an object or \"allow_all\", got {parsed}"
+        ))
+    })?;
+
+    for key in obj.keys() {
+        if !PERMISSION_KEYS.contains(&key.as_str()) {
+            return Err(permissions_error(format!(
+                "unknown permission key {key:?}; known keys: {}",
+                PERMISSION_KEYS.join(", ")
+            )));
         }
+    }
+
+    // `allow_all` is a baseline switch, not a list. `allow_all: ["/tmp"]` used
+    // to parse to `PermValue::List` and then read as `false` through
+    // `matches!(..., True)` — fail-closed, so never a hole, but the one place in
+    // this parser that silently reinterpreted a shape it was handed. That is
+    // exactly what the comment above `PERMISSION_KEYS` refuses to do.
+    let allow_all = match obj.get("allow_all") {
+        Some(value) => match parse_perm_value("allow_all", value)? {
+            PermValue::True => true,
+            PermValue::False => false,
+            PermValue::List(_) => {
+                return Err(permissions_error(
+                    "permission allow_all must be true or false, not a list — it is a baseline \
+                     for every other key, so a list of paths or hosts has no meaning here"
+                        .to_string(),
+                ))
+            }
+        },
+        None => false,
     };
 
-    // `allow_all: true` is a baseline that still honors any `deny_*` overrides
-    // layered on top — documented in the README as `[allow_all: true, deny_X: true]`.
-    // Implemented by defaulting every `allow_*` to `Some(vec![])` (Deno semantics:
-    // empty list = allow all) when allow_all is set, then letting explicit keys
-    // override.
-    let allow_all = obj
-        .get("allow_all")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let allow_default = || if allow_all { Some(vec![]) } else { None };
-    let allow = |key: &str| {
-        obj.get(key)
-            .and_then(parse_string_list)
-            .or_else(allow_default)
+    // `allow_all: true` is a baseline that explicit keys override in BOTH
+    // directions. Previously an explicit `allow_X: false` parsed to `None` and
+    // was then swallowed by `.or_else(allow_default)`, so under `allow_all`
+    // every explicit denial was re-granted as unrestricted access.
+    let allow = |key: &str| -> Result<Option<Vec<String>>, Error> {
+        match obj.get(key) {
+            Some(value) => Ok(allow_option(parse_perm_value(key, value)?)),
+            None if allow_all => Ok(Some(vec![])),
+            None => Ok(None),
+        }
+    };
+    let deny = |key: &str| -> Result<Option<Vec<String>>, Error> {
+        match obj.get(key) {
+            Some(value) => Ok(deny_option(parse_perm_value(key, value)?)),
+            None => Ok(None),
+        }
     };
 
     let opts = deno_runtime::deno_permissions::PermissionsOptions {
-        allow_env: allow("allow_env"),
-        deny_env: obj.get("deny_env").and_then(parse_string_list),
-        allow_net: allow("allow_net"),
-        deny_net: obj.get("deny_net").and_then(parse_string_list),
-        allow_ffi: allow("allow_ffi"),
-        deny_ffi: obj.get("deny_ffi").and_then(parse_string_list),
-        allow_read: allow("allow_read"),
-        deny_read: obj.get("deny_read").and_then(parse_string_list),
-        allow_run: allow("allow_run"),
-        deny_run: obj.get("deny_run").and_then(parse_string_list),
-        allow_sys: allow("allow_sys"),
-        deny_sys: obj.get("deny_sys").and_then(parse_string_list),
-        allow_write: allow("allow_write"),
-        deny_write: obj.get("deny_write").and_then(parse_string_list),
-        allow_import: allow("allow_import"),
-        deny_import: obj.get("deny_import").and_then(parse_string_list),
+        allow_env: allow("allow_env")?,
+        deny_env: deny("deny_env")?,
+        allow_net: allow("allow_net")?,
+        deny_net: deny("deny_net")?,
+        allow_ffi: allow("allow_ffi")?,
+        deny_ffi: deny("deny_ffi")?,
+        allow_read: allow("allow_read")?,
+        deny_read: deny("deny_read")?,
+        allow_run: allow("allow_run")?,
+        deny_run: deny("deny_run")?,
+        allow_sys: allow("allow_sys")?,
+        deny_sys: deny("deny_sys")?,
+        allow_write: allow("allow_write")?,
+        deny_write: deny("deny_write")?,
+        allow_import: allow("allow_import")?,
+        deny_import: deny("deny_import")?,
         ignore_env: None,
         ignore_read: None,
         prompt: false,
@@ -146,11 +353,7 @@ fn build_permissions(
         descriptor_parser.as_ref(),
         &opts,
     )
-    .map_err(|err| Error {
-        message: Some(format!("invalid permissions: {err}")),
-        name: atoms::execution_error(),
-        value: None,
-    })?;
+    .map_err(|err| permissions_error(format!("invalid permissions: {err}")))?;
 
     Ok(deno_runtime::deno_permissions::PermissionsContainer::new(
         descriptor_parser,
@@ -158,11 +361,35 @@ fn build_permissions(
     ))
 }
 
+/// A booted runtime plus the out-of-band handles the rest of the crate needs.
+pub struct Worker {
+    pub worker: MainWorker,
+    pub isolate_handle: deno_core::v8::IsolateHandle,
+    /// Set when the heap cap is hit, so the subsequent uncatchable termination
+    /// error can be reported as `:heap_limit_error` rather than a bare dead
+    /// runtime. Sticky on purpose: V8 clears its own
+    /// `is_execution_terminating` flag once the termination has propagated out
+    /// of the outermost script.
+    ///
+    /// The near-heap-limit closure owns a clone of this `Arc`, and
+    /// `JsRuntime::add_near_heap_limit_callback` boxes that closure into
+    /// `JsRuntime::allocations` — a field declared after `inner` precisely so it
+    /// outlives the isolate. That is the invariant; tyrex does not hand-roll it.
+    pub heap_limit_tripped: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Headroom handed to V8 once when the heap cap is hit, so it can unwind and
+/// report instead of calling `abort()` — which would take down the whole BEAM,
+/// not just the guest.
+const HEAP_LIMIT_SLACK_BYTES: usize = 8 * 1024 * 1024;
+
 pub async fn new(
     runtime_id: usize,
     main_module_path: String,
     permissions_json: String,
-) -> Result<MainWorker, Error> {
+    apply_enabled: bool,
+    max_heap_mb: Option<u64>,
+) -> Result<Worker, Error> {
     let _ = deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cwd = std::env::current_dir().map_err(|err| Error {
         message: Some(format!("could not get current dir: {err}")),
@@ -179,6 +406,14 @@ pub async fn new(
         value: None,
     })?;
     let permissions = build_permissions(&permissions_json)?;
+    let create_params = max_heap_mb.map(|mb| {
+        let max_bytes = (mb as usize).saturating_mul(1024 * 1024);
+        deno_core::v8::CreateParams::default().heap_limits(0, max_bytes)
+    });
+    let module_loader = std::rc::Rc::new(PermissionedModuleLoader {
+        inner: deno_core::FsModuleLoader,
+        permissions: permissions.clone(),
+    });
     let mut worker = MainWorker::bootstrap_from_options(
         &main_module,
         deno_runtime::worker::WorkerServiceOptions::<
@@ -192,7 +427,7 @@ pub async fn new(
             feature_checker: Default::default(),
             fetch_dns_resolver: Default::default(),
             fs: std::sync::Arc::new(deno_fs::RealFs),
-            module_loader: std::rc::Rc::new(deno_core::FsModuleLoader),
+            module_loader,
             node_services: Default::default(),
             npm_process_state_provider: Default::default(),
             permissions,
@@ -203,22 +438,62 @@ pub async fn new(
             bundle_provider: None,
         },
         deno_runtime::worker::WorkerOptions {
-            extensions: vec![extension::init()],
+            extensions: vec![extension::init(runtime_id)],
+            create_params,
             ..Default::default()
         },
     );
-    worker
-        .execute_script(
-            "<anon>",
-            format!("Tyrex._runtimeId = \"{}\"", runtime_id)
-                .to_string()
-                .into(),
-        )
-        .map_err(|err| Error {
-            message: Some(format!("could not seed Tyrex._runtimeId: {err}")),
-            name: atoms::execution_error(),
-            value: None,
-        })?;
+
+    let isolate_handle = worker.js_runtime.v8_isolate().thread_safe_handle();
+
+    // `create_params` caps the heap at isolate creation, but V8's default
+    // response to hitting that cap is `abort()` — the whole BEAM, not the guest.
+    // This callback is what turns the cap into a reportable error. It cannot be
+    // installed any earlier: the isolate does not exist until
+    // `bootstrap_from_options` returns, so deno's bootstrap and snapshot
+    // deserialization run unprotected. That is why `:max_heap_mb` has a floor.
+    let heap_limit_tripped = max_heap_mb.map(|_| {
+        let tripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&tripped);
+        let handle = isolate_handle.clone();
+        let mut granted = false;
+        worker
+            .js_runtime
+            .add_near_heap_limit_callback(move |current_heap_limit, _initial_heap_limit| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                handle.terminate_execution();
+                // Raising the limit is what lets V8 unwind rather than abort,
+                // and execution is already terminated, so the slack only ever
+                // funds teardown. Grant it once: returning `current + 8MB` on
+                // every invocation ratchets the ceiling by 8MB per call instead
+                // of overshooting by a bounded amount.
+                if granted {
+                    current_heap_limit
+                } else {
+                    granted = true;
+                    current_heap_limit + HEAP_LIMIT_SLACK_BYTES
+                }
+            });
+        tripped
+    });
+
+    // The bridge is a privileged capability, not an ambient one. When it is off
+    // we remove the global outright rather than leaving a disabled stub: guest
+    // code then has no reference to reach, and `ext:` modules are structurally
+    // unimportable from user code, so the op cannot be re-acquired.
+    //
+    // Nothing is injected when the bridge is on: the runtime id now lives in
+    // `OpState`, out of guest reach.
+    if !apply_enabled {
+        worker
+            .execute_script("<anon>", String::from("delete globalThis.Tyrex;").into())
+            .map_err(|err| Error {
+                message: Some(format!("could not remove the Tyrex bridge: {err}")),
+                name: atoms::execution_error(),
+                value: None,
+            })?;
+    }
+
     worker
         .execute_main_module(&main_module)
         .await
@@ -227,7 +502,12 @@ pub async fn new(
             name: atoms::execution_error(),
             value: None,
         })?;
-    Ok(worker)
+
+    Ok(Worker {
+        worker,
+        isolate_handle,
+        heap_limit_tripped,
+    })
 }
 
 type PromiseSlab = slab::Slab<(
@@ -251,11 +531,53 @@ fn drain_pending_promises(promises: &mut PromiseSlab) {
     }
 }
 
+/// Whether execution ended because tyrex tore it down, and if so why.
+///
+/// Termination is uncatchable inside V8 and leaves the isolate refusing all
+/// further JavaScript until `cancel_terminate_execution` is called, so tyrex
+/// does not try to nurse a terminated isolate back to health: terminate means
+/// the runtime is dead, and the caller (or its supervisor) starts a fresh one.
+/// That contract is cheap, deterministic, and testable; "sometimes recovers"
+/// is none of those.
+///
+/// `is_execution_terminating` alone is not sufficient. V8 clears the flag once
+/// the termination has propagated out of the outermost script, so by the time
+/// `execute_script` returns it frequently reads false — which is why the heap
+/// cap has its own sticky flag rather than relying on the isolate's state.
+fn termination_error(
+    worker: &mut MainWorker,
+    heap_limit_tripped: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Error> {
+    let tripped_heap_limit = heap_limit_tripped
+        .is_some_and(|tripped| tripped.load(std::sync::atomic::Ordering::SeqCst));
+
+    if tripped_heap_limit {
+        Some(Error {
+            message: Some("guest exceeded its :max_heap_mb heap limit".to_string()),
+            name: atoms::heap_limit_error(),
+            value: None,
+        })
+    } else if worker.js_runtime.v8_isolate().is_execution_terminating() {
+        Some(Error {
+            message: Some("execution was terminated".to_string()),
+            name: atoms::dead_runtime_error(),
+            value: None,
+        })
+    } else {
+        None
+    }
+}
+
 pub async fn run(
     runtime_id: usize,
-    mut worker: MainWorker,
+    handle: Worker,
     mut worker_receiver: tokio::sync::mpsc::UnboundedReceiver<Message>,
 ) {
+    let Worker {
+        mut worker,
+        isolate_handle: _isolate_handle,
+        heap_limit_tripped,
+    } = handle;
     let mut promises: PromiseSlab = slab::Slab::new();
     let mut poll_event_loop = true;
     loop {
@@ -303,9 +625,15 @@ pub async fn run(
                                 "tyrex: Tyrex._applyReply execute_script failed on runtime {runtime_id}: {err}"
                             );
                         }
+                        if termination_error(&mut worker, heap_limit_tripped.as_deref()).is_some() {
+                            runtimes::lock_or_recover().try_remove(runtime_id);
+                            drain_pending_promises(&mut promises);
+                            break;
+                        }
                         poll_event_loop = true;
                     },
                     Message::Eval(code, response_sender) => {
+                        let mut terminated = false;
                         match worker.execute_script("<anon>", code.into()) {
                             Ok(global) => {
                                 let is_promise = {
@@ -345,26 +673,49 @@ pub async fn run(
                                 }
                             },
                             Err(error) => {
-                                if response_sender.send(
-                                    Err(
-                                        Error {
-                                            message: Some(error.to_string()),
-                                            name: atoms::execution_error(),
-                                            value: None
-                                        }
-                                    )
-                                ).is_err() {
+                                // A terminated script reports an uncatchable,
+                                // uninformative error. Attribute it correctly:
+                                // the caller asked for a deadline or blew the
+                                // heap cap, and deserves to be told which.
+                                let reply = match termination_error(
+                                    &mut worker,
+                                    heap_limit_tripped.as_deref(),
+                                ) {
+                                    Some(reason) => {
+                                        terminated = true;
+                                        reason
+                                    }
+                                    None => Error {
+                                        message: Some(error.to_string()),
+                                        name: atoms::execution_error(),
+                                        value: None,
+                                    },
+                                };
+                                if response_sender.send(Err(reply)).is_err() {
                                     eprintln!(
                                         "tyrex: lost reply for Eval execution-error on runtime {runtime_id}"
                                     );
                                 }
                             }
                         };
+                        if terminated {
+                            runtimes::lock_or_recover().try_remove(runtime_id);
+                            drain_pending_promises(&mut promises);
+                            break;
+                        }
                         poll_event_loop = true;
                     }
                 }
             },
             _ = run_event_loop(&mut worker, &mut promises, runtime_id), if poll_event_loop => {
+                // A termination raised while draining microtasks would otherwise
+                // spin here forever: `poll_event_loop` on a terminated isolate
+                // returns Ready(Err) immediately, every time.
+                if termination_error(&mut worker, heap_limit_tripped.as_deref()).is_some() {
+                    runtimes::lock_or_recover().try_remove(runtime_id);
+                    drain_pending_promises(&mut promises);
+                    break;
+                }
                 poll_event_loop = false;
             },
             else => {

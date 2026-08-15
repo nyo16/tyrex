@@ -120,7 +120,6 @@ docker run --rm \
   -e CARGO_HOME=/cargo \
   -e RUSTUP_HOME=/rustup \
   -e "RUSTY_V8_ARCHIVE=/v8-archives/librusty_v8_${TARGET}.a" \
-  -e RUSTLER_NIF_VERSION=2.16 \
   ubuntu:24.04 bash -exc '
     cp -a /build/native/tyrex/* /work/
     cp -a /build/native/tyrex/.cargo /work/ 2>/dev/null || true

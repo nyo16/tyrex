@@ -45,6 +45,8 @@ defmodule Tyrex.Pool do
     * `:strategy` - Dispatch strategy module. Defaults to `Tyrex.Pool.Strategy.RoundRobin`.
     * `:main_module_path` - Path to the main JS module for all runtimes.
     * `:permissions` - Runtime permissions. See `Tyrex.start/1` for details.
+    * `:apply` - Elixir bridge allowlist. See `Tyrex.start/1` for details.
+    * `:max_heap_mb` - Per-runtime V8 heap cap. See `Tyrex.start/1` for details.
   """
   @spec start_link(Keyword.t()) :: Supervisor.on_start()
   def start_link(opts) do
@@ -57,7 +59,9 @@ defmodule Tyrex.Pool do
     name = Keyword.fetch!(opts, :name)
     size = Keyword.get(opts, :size, System.schedulers_online())
     strategy_mod = Keyword.get(opts, :strategy, Tyrex.Pool.Strategy.RoundRobin)
-    runtime_opts = Keyword.take(opts, [:main_module_path, :permissions, :startup_timeout])
+
+    runtime_opts =
+      Keyword.take(opts, [:main_module_path, :permissions, :startup_timeout, :apply, :max_heap_mb])
 
     strategy_state = strategy_mod.init(name, size)
 
