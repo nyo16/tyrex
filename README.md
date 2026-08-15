@@ -334,11 +334,16 @@ model-authored JavaScript:
   adds no layer between the two.
 - Nothing here has been audited or fuzzed as a security boundary.
 - `:max_heap_mb` bounds the V8 heap, not the OS process. CPU, sockets, and file
-  descriptors are not quota'd.
+  descriptors are not quota'd, and a single allocation far exceeding the cap can
+  still abort the node — see [`:max_heap_mb`](#max_heap_mb).
 - `import()` is permission-checked only for the loads guest code initiates. The
   module named by `:main_module_path` and its static imports load regardless of
   `:permissions` — see [Dynamic `import()` vs. the main
   module](#dynamic-import-vs-the-main-module).
+- **stdio is inherited from the host process and is not permissioned.** Deno's
+  permission model does not govern file descriptors 0/1/2, so guest code under
+  `permissions: :none` can write to the node's stdout — forging log lines — and
+  read its stdin, which on an attached `iex` is the operator's keyboard.
 
 If you need a hard security boundary for code you do not control, run Deno
 out-of-process: a separate OS process you can confine with the operating system
@@ -368,8 +373,11 @@ the isolate unusable, so a terminated runtime is never reused:
 {:error, %Tyrex.Error{name: :dead_runtime_error}} = Tyrex.eval("1 + 1", pid: pid)
 ```
 
-Start a fresh runtime. Under a supervision tree or a `Tyrex.Pool` the runtime is
-replaced automatically, so callers only have to retry.
+Start a fresh runtime. Under a supervision tree the runtime is replaced
+automatically. Under a `Tyrex.Pool` it is replaced without disturbing its
+siblings, but a caller whose runtime died mid-call still has to retry, and a
+call that arrives during the restart window gets
+`{:error, %Tyrex.Error{name: :dead_runtime_error}}`.
 
 ### `Tyrex.kill/0,1`
 
@@ -390,11 +398,24 @@ applies, and there is no resume. `Tyrex.stop/1` remains the graceful shutdown.
 {:ok, pid} = Tyrex.start(max_heap_mb: 256)
 ```
 
-Without it, a guest allocating `new Array(1e9)` reaches V8's OOM handler, which
-calls `abort()` and takes the entire BEAM node down. With it, a near-heap-limit
-callback terminates the guest and gives V8 just enough headroom to unwind, so the
-caller gets `{:error, %Tyrex.Error{name: :heap_limit_error}}` instead. The
-runtime is dead afterwards.
+Without it, a guest that exhausts the heap reaches V8's OOM handler, which calls
+`abort()` and takes the entire BEAM node down. With it, a near-heap-limit
+callback terminates the guest and gives V8 headroom to unwind, so the caller gets
+`{:error, %Tyrex.Error{name: :heap_limit_error}}` instead. The runtime is dead
+afterwards.
+
+> #### `:max_heap_mb` does not cover every OOM {: .warning}
+>
+> It converts *incremental* heap growth into `:heap_limit_error` — an allocation
+> loop, a growing accumulator, the usual shapes. It cannot save the node from a
+> **single allocation far larger than the cap**: `new Array(1e9).fill(1)` still
+> aborts the BEAM at caps of 32, 64 and 128 MB. V8 termination only takes effect
+> at an interrupt check, and a builtin like `fill` never reaches one, so the
+> guest is inside C++ when the heap runs out and V8 aborts before tyrex can act.
+> Verified on arm64 macOS with V8 146.4.0. This is a V8 limitation, not a
+> configuration mistake, and no `:max_heap_mb` value avoids it. Treat the cap as
+> protection against gradual exhaustion, not as a guarantee that guest code
+> cannot kill the node.
 
 The minimum is 32 MB. The near-heap-limit callback cannot be armed until the
 isolate exists, so Deno's bootstrap and snapshot deserialization — the heaviest
@@ -404,8 +425,8 @@ bootstrap and 14 boots reliably; the floor sits well above the measured minimum
 because the failure mode is loss of the whole node. Smaller values are rejected
 at `Tyrex.start/1` rather than risked.
 
-`Tyrex.Pool` forwards `:max_heap_mb`, `:permissions`, and `:main_module_path` to
-every runtime in the pool.
+`Tyrex.Pool` forwards `:max_heap_mb`, `:permissions`, `:apply`,
+`:startup_timeout` and `:main_module_path` to every runtime in the pool.
 
 ## Named Runtimes
 
@@ -662,8 +683,9 @@ Run any example with `TYREX_BUILD=true mix run examples/<file>`:
 | `:main_module_path` | unset | ES module loaded at startup |
 | `:name` | unset | Register the runtime under a name |
 
-`Tyrex.Pool` accepts `:permissions`, `:max_heap_mb`, and `:main_module_path` and
-forwards them to every runtime it starts.
+`Tyrex.Pool` accepts `:permissions`, `:apply`, `:max_heap_mb`,
+`:startup_timeout` and `:main_module_path` and forwards them to every runtime it
+starts. It also takes `:max_restarts` / `:max_seconds` for the runtime children.
 
 ### Eval Options
 

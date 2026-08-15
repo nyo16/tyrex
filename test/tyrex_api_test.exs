@@ -55,7 +55,14 @@ defmodule TyrexApiTest do
     test "each bad value raises ArgumentError and leaves the runtime alive" do
       {:ok, pid} = Tyrex.start(permissions: :none)
 
-      for bad <- [-1, 0, 5.5, nil, "5"] do
+      # Both bands, not just the negative one. The upper bound was missed on the
+      # first pass and the review caught it still live: `10_000_000_000_000`
+      # raised `:badarg` inside `Process.send_after/3` and left
+      # `Process.alive?/1` false, and anything above the `GenServer.call`
+      # `receive after` ceiling raised in the caller *after* the eval had
+      # already been dispatched — a runaway guest with no effective deadline,
+      # which is exactly what refusing `:infinity` exists to prevent.
+      for bad <- [-1, 0, 5.5, nil, "5", 4_294_967_295, 5_000_000_000, 10_000_000_000_000] do
         assert_raise ArgumentError, ~r/:timeout must be a positive integer/, fn ->
           Tyrex.eval("1 + 2", pid: pid, timeout: bad)
         end

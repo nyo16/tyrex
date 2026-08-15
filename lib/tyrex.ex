@@ -141,7 +141,10 @@ defmodule Tyrex do
       minimum is #{@min_heap_mb}; a smaller cap raises `ArgumentError`, because
       deno's bootstrap allocates before the near-heap-limit callback can be
       installed and so would `abort()` the BEAM at `start/1` — the outcome this
-      option exists to prevent.
+      option exists to prevent. Note the cap converts *incremental* heap growth
+      into `:heap_limit_error`; it cannot save the node from a single allocation
+      far larger than the cap, because V8 termination only takes effect at an
+      interrupt check and a builtin never reaches one. See the README.
     * `:startup_timeout` - Maximum time in milliseconds to wait for the NIF
       to acknowledge runtime startup. Defaults to `30_000`. If the NIF does
       not respond in time, `init/1` returns `{:stop, :nif_startup_timeout}`.
@@ -150,8 +153,11 @@ defmodule Tyrex do
 
   Control what Deno I/O the JavaScript runtime can perform:
 
-    * `:none` — No Deno I/O (default). JavaScript can compute, but not read
-      files, open sockets, read env, or spawn processes.
+    * `:none` — No permissioned Deno I/O (default). JavaScript can compute, but
+      not read files, open sockets, read env, or spawn processes. It does **not**
+      cover stdio: file descriptors 0/1/2 are inherited from the host OS process
+      and Deno's permission model does not govern them, so guest code can still
+      write to the node's stdout and read its stdin.
     * `:allow_all` — Full access to everything.
     * Keyword list — Granular control per permission type.
 
@@ -606,23 +612,40 @@ defmodule Tyrex do
 
   defp call_timeout(timeout), do: timeout + @deadline_grace_ms
 
-  # `:timeout` ends up in `Process.send_after/3` on the server, where a negative
-  # or non-integer value raises *inside the GenServer* and kills the runtime —
-  # and under `Tyrex.Pool`'s `:rest_for_one` supervision, every runtime ordered
-  # after it. Nothing upstream caught that, because `call_timeout(-1)` is itself
-  # a legal `GenServer.call` timeout. Validating here keeps a caller's bad
-  # argument with the caller.
+  # `:timeout` ends up in `Process.send_after/3` on the server, where a value
+  # outside the BEAM's timer range raises *inside the GenServer* and kills the
+  # runtime — and under `Tyrex.Pool`'s supervision, potentially its siblings.
+  # Nothing upstream caught that, because `call_timeout(-1)` is itself a legal
+  # `GenServer.call` timeout. Validating here keeps a caller's bad argument with
+  # the caller.
   #
+  # The upper bound is as load-bearing as the lower one, and was missed on the
+  # first pass. Two bands escaped a sign-only check:
+  #
+  #   * above `4_294_967_295 - @deadline_grace_ms`, `call_timeout/1` overflows
+  #     `GenServer.call`'s own `receive after` ceiling, so the caller raises
+  #     `:timeout_value` *after* the eval was already dispatched — leaving a
+  #     runaway guest with an effectively unbounded deadline, which is precisely
+  #     what refusing `:infinity` exists to prevent;
+  #   * above `9_223_372_034_790`, `Process.send_after/3` raises `:badarg` and
+  #     takes the runtime down. Reproduced: `timeout: 10_000_000_000_000` left
+  #     `Process.alive?/1` false.
+  #
+  # One bound covers both, since the tighter of the two is the call ceiling.
+  @max_timeout 4_294_967_295 - @deadline_grace_ms
+
   # `:infinity` is well-formed and so does not raise: `eval/2` refuses it with
   # `:unsupported_option`, which is what the blocking path already did.
   defp validate_timeout!(:infinity), do: :infinity
 
-  defp validate_timeout!(timeout) when is_integer(timeout) and timeout > 0, do: timeout
+  defp validate_timeout!(timeout)
+       when is_integer(timeout) and timeout > 0 and timeout <= @max_timeout,
+       do: timeout
 
   defp validate_timeout!(other) do
     raise ArgumentError,
-          ":timeout must be a positive integer number of milliseconds or :infinity, " <>
-            "got: #{inspect(other)}"
+          ":timeout must be a positive integer number of milliseconds between 1 and " <>
+            "#{@max_timeout} (or :infinity, which is refused), got: #{inspect(other)}"
   end
 
   # `GenServer.call/3` wraps the server's exit reason as
@@ -631,9 +654,17 @@ defmodule Tyrex do
   # window every deadline, heap trip and `kill/1` opens. Everything else — most
   # importantly a `:timeout` from the call itself, which means the server-side
   # deadline lost its race — keeps propagating.
+  #
+  # The bare `:shutdown` atom and `:killed` matter as much as the 2-tuple and
+  # were missed on the first pass: bare `:shutdown` is what a *supervisor* sends
+  # a child, which is the dominant window under `Tyrex.Pool`, and `:killed` is
+  # both `:brutal_kill` and `stop/1`'s own escalation branch. `terminate/2` does
+  # not run on either, so `fail_inflight/2` cannot cover them.
   defp dead_runtime_exit?({reason, {GenServer, :call, _args}}), do: dead_runtime_exit?(reason)
   defp dead_runtime_exit?(:noproc), do: true
   defp dead_runtime_exit?(:normal), do: true
+  defp dead_runtime_exit?(:shutdown), do: true
+  defp dead_runtime_exit?(:killed), do: true
   defp dead_runtime_exit?({:shutdown, _reason}), do: true
   defp dead_runtime_exit?(_reason), do: false
 

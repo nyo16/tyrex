@@ -1,8 +1,20 @@
 defmodule TyrexPoolTest do
   use ExUnit.Case, async: false
 
-  defp runtime_children(sup) do
-    sup
+  # Runtimes live one level down, under `Tyrex.Pool.RuntimeSupervisor`, so that a
+  # single guest's deadline or heap trip cannot restart its siblings.
+  defp runtime_supervisor(pool_sup) do
+    pool_sup
+    |> Supervisor.which_children()
+    |> Enum.find_value(fn
+      {Tyrex.Pool.RuntimeSupervisor, pid, _type, _mods} when is_pid(pid) -> pid
+      _ -> nil
+    end)
+  end
+
+  defp runtime_children(pool_sup) do
+    pool_sup
+    |> runtime_supervisor()
     |> Supervisor.which_children()
     |> Enum.filter(fn
       {{Tyrex, _i}, _pid, _type, _mods} -> true
@@ -279,6 +291,83 @@ defmodule TyrexPoolTest do
       # unrelated entries created by other code in this VM).
       after_count = :persistent_term.info().count
       assert after_count - base <= 1
+    end
+  end
+
+  # Making eval deadlines real turned a guest-triggered, caller-local timeout
+  # into a supervisor restart event. With the runtimes directly under the pool's
+  # `:rest_for_one` supervisor that was a denial of service reachable from
+  # `while (true) {}`: one deadline restarted every runtime ordered after the
+  # victim (measured 4/4 for a pool of four), and five deadlines in ~2.5s
+  # exhausted the default intensity and took the pool supervisor down with
+  # `:shutdown`. Siblings were signalled rather than stopped, so their
+  # `terminate/2` — and the in-flight drain it performs — was skipped, and
+  # `{:shutdown, _}` terminations are not logged, so the churn was silent.
+  describe "one guest cannot take out the pool" do
+    @tag timeout: 120_000
+    test "a deadline on one runtime leaves its siblings untouched" do
+      {:ok, sup} = Tyrex.Pool.start_link(name: :blast_pool, size: 4, permissions: :none)
+      names = for i <- 0..3, do: :"blast_pool.Runtime.#{i}"
+      before = Map.new(names, fn n -> {n, Process.whereis(n)} end)
+      assert Enum.all?(before, fn {_n, pid} -> is_pid(pid) end)
+
+      victim = before[:"blast_pool.Runtime.0"]
+      ref = Process.monitor(victim)
+      spawn(fn -> Tyrex.eval("for(;;){}", pid: victim, timeout: 300) end)
+      assert_receive {:DOWN, ^ref, :process, ^victim, {:shutdown, :timeout}}, 5_000
+
+      # Let the supervisor replace it.
+      assert eventually(fn -> is_pid(Process.whereis(:"blast_pool.Runtime.0")) end)
+
+      # The victim was replaced...
+      refute Process.whereis(:"blast_pool.Runtime.0") == victim
+
+      # ...and nothing else moved. This is the assertion: under `:rest_for_one`
+      # all three siblings had a new pid here.
+      for n <- tl(names) do
+        assert Process.whereis(n) == before[n],
+               "#{n} was restarted by an unrelated runtime's deadline"
+
+        assert Process.alive?(before[n])
+      end
+
+      Supervisor.stop(sup)
+    end
+
+    @tag timeout: 120_000
+    test "repeated deadlines do not exhaust the pool supervisor" do
+      {:ok, sup} = Tyrex.Pool.start_link(name: :storm_pool, size: 2, permissions: :none)
+
+      # Six is comfortably past the default intensity of 3-in-5s that killed the
+      # supervisor before the runtimes were rescoped.
+      for _ <- 1..6 do
+        victim = Process.whereis(:"storm_pool.Runtime.0")
+
+        if is_pid(victim) do
+          ref = Process.monitor(victim)
+          spawn(fn -> Tyrex.eval("for(;;){}", pid: victim, timeout: 200) end)
+          assert_receive {:DOWN, ^ref, :process, ^victim, _}, 5_000
+        end
+
+        assert Process.alive?(sup), "the pool supervisor died after a guest deadline"
+      end
+
+      assert eventually(fn -> match?({:ok, 1}, Tyrex.Pool.eval(:storm_pool, "1")) end)
+
+      Supervisor.stop(sup)
+    end
+  end
+
+  defp eventually(fun, attempts \\ 50)
+
+  defp eventually(_fun, 0), do: false
+
+  defp eventually(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(100)
+      eventually(fun, attempts - 1)
     end
   end
 end

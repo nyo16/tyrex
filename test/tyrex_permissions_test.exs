@@ -329,6 +329,52 @@ defmodule TyrexPermissionsTest do
       Tyrex.stop(pid: pid)
     end
 
+    # Not an apply-bridge escape, but the same shape of hole and the reason this
+    # block exists: a capability the guest reaches that no permission governs.
+    #
+    # `WorkerOptions::default()` supplies
+    # `create_web_worker_cb = |_| unimplemented!("web workers are not
+    # supported")`, and `op_create_worker` checks no permission on the specifier.
+    # So before the fix, `new Worker(url, {type: "module"})` under
+    # `permissions: :none` reached that `unimplemented!()` on a spawned thread,
+    # dropped the handle sender, and made the worker thread's
+    # `handle_receiver.recv().unwrap()` panic inside a V8 `extern "C"` callback —
+    # `panic_cannot_unwind`, SIGABRT, whole node gone (reproduced: exit 134). No
+    # `catch_unwind` could contain it, so the constructor is deleted at bootstrap.
+    #
+    # If this ever regresses, the test does not fail: it takes the whole test VM
+    # with it. That is the strongest possible signal and there is no gentler one
+    # available, because the failure mode is `abort()`.
+    test "the Worker constructor is gone, so guest JS cannot abort the node" do
+      {:ok, pid} = Tyrex.start(permissions: :none)
+
+      assert {:ok, "undefined"} = Tyrex.eval("typeof Worker", pid: pid)
+      assert {:ok, false} = Tyrex.eval(~s|"Worker" in globalThis|, pid: pid)
+
+      # And constructing one is now an ordinary JS error the guest can catch,
+      # rather than an abort. The runtime must still be serving afterwards.
+      assert {:ok, message} =
+               Tyrex.eval(
+                 ~s|(() => { try { new Worker("file:///tmp/x.js", {type: "module"}); return "CONSTRUCTED"; } catch (e) { return String(e && e.name ? e.name : e); } })()|,
+                 pid: pid
+               )
+
+      refute message == "CONSTRUCTED"
+      assert {:ok, 3} = Tyrex.eval("1 + 2", pid: pid)
+
+      Tyrex.stop(pid: pid)
+    end
+
+    # The bridge being on must not put `Worker` back.
+    test "the Worker constructor is gone with the apply bridge enabled too" do
+      {:ok, pid} = Tyrex.start(apply: [{Enum, :sum, 1}])
+
+      assert {:ok, "undefined"} = Tyrex.eval("typeof Worker", pid: pid)
+      assert {:ok, "object"} = Tyrex.eval("typeof globalThis.Tyrex", pid: pid)
+
+      Tyrex.stop(pid: pid)
+    end
+
     test "an allowlisted MFA is permitted" do
       {:ok, pid} = Tyrex.start(apply: [{Enum, :sum, 1}])
 

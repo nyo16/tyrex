@@ -456,43 +456,60 @@ pub async fn new(
         let tripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&tripped);
         let handle = isolate_handle.clone();
-        let mut granted = false;
         worker
             .js_runtime
             .add_near_heap_limit_callback(move |current_heap_limit, _initial_heap_limit| {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 handle.terminate_execution();
-                // Raising the limit is what lets V8 unwind rather than abort,
-                // and execution is already terminated, so the slack only ever
-                // funds teardown. Grant it once: returning `current + 8MB` on
-                // every invocation ratchets the ceiling by 8MB per call instead
-                // of overshooting by a bounded amount.
-                if granted {
-                    current_heap_limit
-                } else {
-                    granted = true;
-                    current_heap_limit + HEAP_LIMIT_SLACK_BYTES
-                }
+                // Raising the limit is what lets V8 unwind rather than abort, and
+                // execution is already terminated, so the slack only ever funds
+                // teardown.
+                //
+                // This MUST return a strictly greater limit every single time.
+                // `Heap::InvokeNearHeapLimitCallback` treats an unraised limit as
+                // callback failure and calls `FatalProcessOutOfMemory` — abort()
+                // — so V8 offers no way to say "fail this allocation". A previous
+                // version granted the slack only once, to stop the ceiling
+                // ratcheting by 8MB per invocation; that made every second
+                // invocation fatal to the whole BEAM. Verified by making the
+                // callback never grow: an allocation shape that terminates
+                // cleanly with growth instead died with "Fatal JavaScript out of
+                // memory". The ratchet is bounded by terminate-means-dead: the
+                // runtime is already dead, so growth is bounded in wall-clock.
+                current_heap_limit + HEAP_LIMIT_SLACK_BYTES
             });
         tripped
     });
 
+    // `Worker` is removed unconditionally, and it is not optional hardening.
+    // tyrex takes `WorkerOptions { ..Default::default() }`, whose
+    // `create_web_worker_cb` is `|_| unimplemented!("web workers are not
+    // supported")`. `op_create_worker` checks no permission, so under
+    // `permissions: :none` two lines of guest JavaScript —
+    // `new Worker(url, {type: "module"})` — reach that `unimplemented!()` on a
+    // spawned thread, drop the handle sender, and make this thread's
+    // `handle_receiver.recv().unwrap()` panic inside a V8 `extern "C"` callback.
+    // That converts to `panic_cannot_unwind` and aborts the OS process: no
+    // `catch_unwind` anywhere can contain it, and `deno_core` has none. Deleting
+    // the constructor costs nothing, because web workers never worked here.
+    //
     // The bridge is a privileged capability, not an ambient one. When it is off
     // we remove the global outright rather than leaving a disabled stub: guest
     // code then has no reference to reach, and `ext:` modules are structurally
-    // unimportable from user code, so the op cannot be re-acquired.
-    //
-    // Nothing is injected when the bridge is on: the runtime id now lives in
-    // `OpState`, out of guest reach.
+    // unimportable from user code, so the op cannot be re-acquired. Nothing is
+    // injected when the bridge is on — the runtime id lives in `OpState`, out of
+    // guest reach.
+    let mut bootstrap = String::from("delete globalThis.Worker;");
     if !apply_enabled {
-        worker
-            .execute_script("<anon>", String::from("delete globalThis.Tyrex;").into())
-            .map_err(|err| Error {
-                message: Some(format!("could not remove the Tyrex bridge: {err}")),
-                name: atoms::execution_error(),
-                value: None,
-            })?;
+        bootstrap.push_str("delete globalThis.Tyrex;");
     }
+    worker
+        .execute_script("<anon>", bootstrap.into())
+        .map_err(|err| Error {
+            message: Some(format!("could not seal the guest global scope: {err}")),
+            name: atoms::execution_error(),
+            value: None,
+        })?;
 
     worker
         .execute_main_module(&main_module)

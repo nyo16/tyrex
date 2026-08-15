@@ -211,10 +211,29 @@ defmodule TyrexLifecycleTest do
       refute Process.alive?(pid)
     end
 
-    test "rejects a nonsense cap" do
+    # The floor is the whole of the fix for "a small cap aborts the BEAM inside
+    # bootstrap". Asserting only against 0 does not test it: 0 was rejected by
+    # the old `mb > 0` guard too, and both guards produce a message containing
+    # "positive integer". Only the rows either side of the floor discriminate,
+    # so those are the rows asserted.
+    test "rejects a cap below the measured bootstrap floor" do
+      assert_raise ArgumentError, ~r/at least 32/, fn ->
+        Tyrex.start(permissions: :none, max_heap_mb: 31)
+      end
+
+      assert_raise ArgumentError, ~r/at least 32/, fn ->
+        Tyrex.start(permissions: :none, max_heap_mb: 1)
+      end
+
       assert_raise ArgumentError, ~r/positive integer/, fn ->
         Tyrex.start(permissions: :none, max_heap_mb: 0)
       end
+    end
+
+    test "accepts the floor itself" do
+      {:ok, pid} = Tyrex.start(permissions: :none, max_heap_mb: 32)
+      assert {:ok, 3} = Tyrex.eval("1 + 2", pid: pid)
+      Tyrex.stop(pid: pid)
     end
   end
 
