@@ -67,6 +67,16 @@ defmodule Tyrex.MixProject do
         "LICENSE"
       ],
       source_ref: "v#{@version}",
+      # `Tyrex.Native` is `@moduledoc false` on purpose — it is the raw NIF
+      # boundary, not public API — but the README and CHANGELOG legitimately name
+      # it and its functions when explaining how loading and termination work.
+      # Without this, ex_doc tries to link those mentions and warns on every
+      # build. Suppressing the link is right; rewording the prose to avoid
+      # naming the module would make the explanations worse.
+      skip_code_autolink_to: [
+        "Tyrex.Native",
+        "Tyrex.Native.terminate_runtime/1"
+      ],
       groups_for_modules: [
         Core: [Tyrex, Tyrex.Error, Tyrex.Runtime],
         "Inline JS": [Tyrex.Sigil, Tyrex.Inline],
