@@ -42,6 +42,24 @@ defmodule TyrexLifecycleTest do
     test "a deadline does not fire for work that finishes in time" do
       {:ok, pid} = Tyrex.start(permissions: :none)
 
+      # The `{:deadline, from}` clause drops a `from` it no longer holds, so a
+      # stale timer leaves no other outward mark — tracing receives is how we
+      # see the timer itself.
+      #
+      # Arm it *before* the evals. Armed afterwards, a `{:deadline, _}`
+      # delivered between the second eval's reply and `:erlang.trace/3` is
+      # never recorded, so `refute_receive` below passes by not looking rather
+      # than by observing nothing — the test stops testing instead of going
+      # red, which is the fail-closed failure this whole file exists to catch.
+      # The extra `$gen_call` and `:eval_reply` trace messages this collects do
+      # not match the refute pattern and are skipped by the selective receive.
+      :erlang.trace(pid, true, [:receive])
+
+      # The trace dies with the traced process, so stopping the runtime however
+      # this test exits is what keeps the flag from following the pid into a
+      # later test.
+      on_exit(fn -> Tyrex.stop(pid: pid) end)
+
       # 300ms deadlines against sub-millisecond work, so the window in which a
       # stale timer could fire is *inside* this test. With `timeout: 5_000` the
       # uncancelled timer fired ~4.8s after the test had already finished, and
@@ -50,11 +68,8 @@ defmodule TyrexLifecycleTest do
       assert {:ok, 3} = Tyrex.eval("1 + 2", pid: pid, timeout: 300)
       assert {:ok, 4} = Tyrex.eval("2 + 2", pid: pid, timeout: 300)
 
-      # The `{:deadline, from}` clause drops a `from` it no longer holds, so a
-      # stale timer leaves no other outward mark — tracing receives is how we
-      # see the timer itself. This waits longer than the deadline above, so a
-      # timer that was going to fire has fired by the time we stop tracing.
-      :erlang.trace(pid, true, [:receive])
+      # This waits longer than the deadline above, so a timer that was going to
+      # fire has fired by the time we stop tracing.
       refute_receive {:trace, ^pid, :receive, {:deadline, _}}, 600
       :erlang.trace(pid, false, [:receive])
 
@@ -78,7 +93,20 @@ defmodule TyrexLifecycleTest do
       Process.sleep(300)
       :ok = Tyrex.kill(pid: pid)
 
-      assert {:error, %Tyrex.Error{name: :dead_runtime_error}} = Task.await(caller, 10_000)
+      # The `:name` alone cannot fail — `dead_runtime_exit?/1` manufactures it
+      # from any dead-runtime exit, so this assertion held even with
+      # `fail_inflight/2` deleted from `terminate/2`. The `:message` names the
+      # producer, and for `kill/1` the producer is deliberately the *exit
+      # mapping*, not the drain: `kill/1` is an untrappable
+      # `Process.exit(pid, :kill)`, so `terminate/2` never runs and there is
+      # nobody left to reply. Pinning "already gone" is what makes this a claim
+      # about `dead_runtime_exit?/1` covering `:killed` — drop `:killed` from it
+      # and this caller exits instead of getting a tuple. The reply-side drain
+      # is pinned by the "in flight" message in test/tyrex_api_test.exs.
+      assert {:error, %Tyrex.Error{name: :dead_runtime_error, message: message}} =
+               Task.await(caller, 10_000)
+
+      assert message =~ "already gone"
     end
   end
 
@@ -97,12 +125,44 @@ defmodule TyrexLifecycleTest do
 
       elapsed = System.monotonic_time(:millisecond) - started
 
-      # `kill/1` ends in `catch :exit, _ -> :ok`, so the `:ok` above is true of
-      # a wedged runtime that never answered as well as of an interrupted one.
-      # Promptness is the property that catch-all hides: the interrupt reaches
-      # into the isolate from outside and must not wait on the guest, which
-      # never yields, nor on `kill/1`'s own 5s call timeout.
+      # `kill/1` ends in an untrappable exit, but it used to be a
+      # `GenServer.call` — which this non-blocking case could still serve,
+      # because the GenServer is idle while the guest spins. That is why this
+      # test passed against a `kill/1` that was inert on the case its docstring
+      # actually promises; see the `blocking: true` test below, which is the one
+      # that could not be served.
       assert elapsed < 2_000, "kill/1 to :DOWN took #{elapsed}ms"
+    end
+
+    # The case `kill/1`'s docstring is *about*, and the case it silently failed.
+    #
+    # With `blocking: true` the GenServer parks inside `Native.eval_blocking/3`,
+    # so a `GenServer.call(:kill)` can never be served. Measured against the old
+    # implementation: `kill/1` returned `:ok` after 5002ms with the runtime still
+    # alive, because `catch :exit, _ -> :ok` reported its own call timeout as
+    # success. Asserting `:ok` alone cannot catch that — hence the liveness and
+    # promptness assertions.
+    test "interrupts a guest wedged inside the blocking NIF" do
+      {:ok, pid} = Tyrex.start(permissions: :none)
+
+      spawn(fn -> Tyrex.eval(@runaway, pid: pid, blocking: true, timeout: 60_000) end)
+      Process.sleep(500)
+
+      assert {:current_function, {Tyrex.Native, :eval_blocking, 3}} =
+               Process.info(pid, :current_function)
+
+      ref = Process.monitor(pid)
+      started = System.monotonic_time(:millisecond)
+
+      assert :ok = Tyrex.kill(pid: pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      refute Process.alive?(pid)
+
+      # Well under the 5s that the old call-timeout no-op took.
+      assert elapsed < 2_000, "kill/1 on a blocking wedge took #{elapsed}ms"
     end
 
     test "is safe to call on an already-dead runtime" do
@@ -235,6 +295,24 @@ defmodule TyrexLifecycleTest do
       assert {:ok, 3} = Tyrex.eval("1 + 2", pid: pid)
       Tyrex.stop(pid: pid)
     end
+
+    test "a main module that blows the cap fails start with :heap_limit_error" do
+      # The near-heap-limit callback is installed, and its sticky flag live,
+      # before `worker::new` evaluates the main module — but both of that
+      # function's fallible steps used to map straight to :execution_error, so
+      # an operator whose `:main_module_path` blew a tight cap got V8's
+      # uninformative post-termination message with no hint of the cause.
+      # Equality on the name is the point: revert the flag consult in
+      # `worker::new` and this reports :execution_error instead.
+      assert {:error, %Tyrex.Error{name: :heap_limit_error} = error} =
+               Tyrex.start(
+                 permissions: :none,
+                 max_heap_mb: 32,
+                 main_module_path: "test/support/heap_hog.js"
+               )
+
+      assert error.message =~ ":max_heap_mb"
+    end
   end
 
   describe "pool recovery" do
@@ -250,14 +328,23 @@ defmodule TyrexLifecycleTest do
       :ok = Tyrex.kill(pid: victim)
       assert_receive {:DOWN, ^ref, :process, ^victim, _}, 5_000
 
-      # The supervisor rebuilds the child. The pool is :rest_for_one, so the
-      # sibling is torn down and replaced too; calls during that window exit
-      # with :noproc rather than returning an error tuple.
+      # `Tyrex.Pool.RuntimeSupervisor` rebuilds the killed child in place. That
+      # layer is :one_for_one since 27bb9df, so the sibling is never torn down
+      # and keeps answering throughout; only a call the strategy routes at the
+      # dead name during the restart window is affected. Since task 2.4 of the
+      # previous plan those no longer exit either — `Tyrex.eval/2`'s
+      # `dead_runtime_exit?/1` maps the :noproc to
+      # {:error, %Tyrex.Error{name: :dead_runtime_error}}.
+      #
+      # So there is deliberately no `catch :exit` here: nothing this loop can
+      # provoke is still supposed to escape as an exit, and a `catch` wide
+      # enough to swallow one would also swallow the regression where that
+      # mapping is lost. Any other return value is a CaseClauseError, on
+      # purpose.
       assert eventually(fn ->
-               try do
-                 match?({:ok, 2}, Tyrex.Pool.eval(:recovery_pool, "2"))
-               catch
-                 :exit, _ -> false
+               case Tyrex.Pool.eval(:recovery_pool, "2") do
+                 {:ok, 2} -> true
+                 {:error, %Tyrex.Error{name: :dead_runtime_error}} -> false
                end
              end)
 
@@ -285,6 +372,18 @@ defmodule TyrexLifecycleTest do
           spawn(fn -> Tyrex.eval(@runaway, pid: pid, timeout: 120_000) end)
           pid
         end
+
+      # The burn assertion below runs before the explicit stops, and it is
+      # designed to go red on an under-provisioned runner. Without this, one
+      # honest red leaves three `for(;;){}` runtimes burning a core each for
+      # the rest of the VM, and every later CPU measurement is shifted by ~1.0
+      # core per surviving runaway: with the leak live, this test's own baseline
+      # was measured at 4.01 cores instead of 0.005, so `running > burn_floor`
+      # then passes or fails for a reason unrelated to what it is testing.
+      # Cleanup has to survive the failure, so it is registered here
+      # rather than trailing the assertions. The explicit `stop/1` further down
+      # stays: it is the measurement, not the cleanup.
+      on_exit(fn -> Enum.each(pids, &Tyrex.stop(pid: &1)) end)
 
       Process.sleep(1_000)
 
@@ -318,6 +417,95 @@ defmodule TyrexLifecycleTest do
              "CPU did not return to baseline after stop/1 " <>
                "(baseline #{baseline}, running #{running}, after #{after_stop}, " <>
                "ceiling #{ceiling}) — the per-runtime OS thread leaked"
+    end
+
+    # The same probe on the `blocking: true` path, which the test above cannot
+    # reach — and the distinction is the whole point. With `blocking: false`
+    # the GenServer is idle while the guest spins, so `terminate/2` runs, drops
+    # the last `ResourceArc` reference, and `Runtime::drop` reclaims the
+    # thread. With `blocking: true` the GenServer is parked *inside*
+    # `Native.eval_blocking/3`, holding a reference in a NIF call frame that
+    # nothing can unwind while the worker never yields: `stop/1` escalates to a
+    # brutal kill, the process dies, and the refcount still never reaches zero.
+    #
+    # Cores still burning after every runtime was stopped and every Elixir
+    # process was dead, three runaways:
+    #
+    #     path                      before   after
+    #     blocking: false, stop/1    0.00     0.00   <- the test above
+    #     blocking: true,  stop/1    3.00     0.00
+    #     blocking: true,  kill/1    2.97     0.00
+    #
+    # The fix is `Runtime`'s `rustler::Resource::down` owner-death monitor
+    # (`native/tyrex/src/runtime.rs`), which fires whatever the owner was
+    # executing. Revert `IMPLEMENTS_DOWN`/`down` and this test goes red at
+    # ~3.0 cores while the rest of the suite stays green — which is exactly why
+    # these two tests must not be consolidated: the non-blocking one was green
+    # across the entire life of the leak.
+    @tag timeout: 120_000
+    test "CPU returns to baseline after stop/1 on the blocking path" do
+      baseline = cpu_cores_used(2_000)
+
+      pids =
+        for _ <- 1..3 do
+          {:ok, pid} = Tyrex.start(permissions: :none)
+
+          # 120s, deliberately far longer than this test runs. `eval_blocking`
+          # terminates the isolate itself when its own deadline expires, so a
+          # short timeout reclaims the thread for the wrong reason and leaves
+          # this test green against the unfixed code. The deadline must not be
+          # able to fire before the assertions below.
+          spawn(fn -> Tyrex.eval(@runaway, pid: pid, blocking: true, timeout: 120_000) end)
+
+          pid
+        end
+
+      # Same hazard as the probe above. Note this is complementary to the
+      # owner-death monitor, not redundant with it: `on_exit` guarantees
+      # `stop/1` is *called* on every exit path, the monitor is what makes that
+      # call actually reclaim the thread. With the monitor reverted this
+      # cleanup runs and the threads still leak.
+      on_exit(fn -> Enum.each(pids, &Tyrex.stop(pid: &1)) end)
+
+      Process.sleep(1_000)
+
+      # Pin that the runtimes really are parked in the NIF. If `blocking: true`
+      # ever stops parking the GenServer, this test silently degrades into a
+      # duplicate of the non-blocking one and stops covering the leak.
+      assert Enum.all?(pids, fn pid ->
+               Process.info(pid, :current_function) ==
+                 {:current_function, {Tyrex.Native, :eval_blocking, 3}}
+             end)
+
+      running = cpu_cores_used(1_000)
+
+      burners = min(3, System.schedulers_online())
+      burn_floor = burners * 0.6
+
+      assert running > baseline + burn_floor,
+             "expected the blocking runaways to burn CPU (baseline #{baseline}, " <>
+               "running #{running}, floor #{baseline + burn_floor} for #{burners} burners)"
+
+      # Monitor before stopping: the parked GenServer cannot service the
+      # shutdown, so each `stop/1` spends its whole timeout before escalating
+      # and the process death is asynchronous to `stop/1` returning.
+      refs = Enum.map(pids, &Process.monitor/1)
+      Enum.each(pids, &Tyrex.stop(pid: &1))
+
+      Enum.each(refs, fn ref ->
+        assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 10_000
+      end)
+
+      # Let the worker threads finish unwinding.
+      Process.sleep(1_000)
+
+      after_stop = cpu_cores_used(4_000)
+      ceiling = idle_cpu_ceiling()
+
+      assert after_stop < ceiling,
+             "CPU did not return to baseline after stop/1 on a blocking eval " <>
+               "(baseline #{baseline}, running #{running}, after #{after_stop}, " <>
+               "ceiling #{ceiling}) — the owner-death monitor did not reclaim the thread"
     end
   end
 

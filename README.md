@@ -31,7 +31,19 @@ def deps do
 end
 ```
 
-To build from source (instead of using precompiled binaries):
+To build from source (instead of using precompiled binaries), add `:rustler` to
+your own dependencies as well. Tyrex declares it `optional: true`, so it is not
+installed on your behalf, and `TYREX_BUILD=true` without it fails at compile time
+with `Rustler dependency is needed to force the build.`:
+
+```elixir
+def deps do
+  [
+    {:tyrex, "~> 0.4.0"},
+    {:rustler, ">= 0.0.0", optional: true}
+  ]
+end
+```
 
 ```bash
 export TYREX_BUILD=true
@@ -756,7 +768,9 @@ If your platform is not listed above, you'll need to build from source:
 
 ## Building from Source
 
-Requires Rust 1.92+ and LLVM 20:
+Requires Rust 1.92+, LLVM 20, and `{:rustler, ">= 0.0.0", optional: true}` in the
+consuming project's `deps` (see [Installation](#installation) — tyrex's own
+`:rustler` is optional, so it is not installed for you):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -783,7 +797,10 @@ The order of these four steps is load-bearing:
 
 1. Tag the version already in `mix.exs` and push the tag. The `Precomp NIFs`
    workflow builds all four targets and attaches the archives to the GitHub
-   release.
+   release. Its last step then reports, in the run summary, that the checksum
+   file does not yet cover this version. That report is a `::notice`, not a
+   failure: the checksums are of the archives that run just uploaded, so no
+   commit reachable from the tag can contain them.
 2. Regenerate the checksum file from the published archives, via the
    `checksums.after_release` alias:
 
@@ -797,8 +814,9 @@ The order of these four steps is load-bearing:
    has to build from source.
 3. Commit the regenerated `checksum-Elixir.Tyrex.Native.exs`.
 4. `mix hex.publish`. It is aliased to run a guard first, which aborts the
-   publish if the checksum file has no entry for the current `@version` — step 2
-   is not optional and will not be skipped silently.
+   publish unless the checksum file has an entry for the current `@version` on
+   all four targets — step 2 is not optional and will not be skipped silently.
+   `mix hex.publish docs` is exempt: it ships no NIF archives.
 
 The sequence cannot be permuted: step 2 downloads exactly what step 1 published,
 and step 4 ships the checksum map step 2 writes. Publishing before regenerating

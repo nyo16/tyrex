@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - master
+    # `paths` narrows the *branch* half of this trigger only: GitHub does not
+    # evaluate path filters for pushes of tags ("Path filters are not evaluated
+    # for pushes of tags", Actions docs, *Triggering a workflow*). So a release
+    # tag on a commit that touches nothing under native/ still builds — which is
+    # the case that matters, since the `publish` job below only runs on tags.
     paths:
       - "native/**"
       - ".github/workflows/release.yml"
@@ -254,7 +259,11 @@ jobs:
           # agree before building: a silent disagreement here is how you ship a
           # binary whose filename promises an ABI it was not compiled against.
           FEATURE="nif_version_${NIF_VERSION//./_}"
-          if ! grep -q "\"$FEATURE\"" Cargo.toml; then
+          # Anchored to the dependency line on purpose: the comment block above
+          # it in Cargo.toml contains the literal ["nif_version_2_15"], so an
+          # unanchored grep would let a relabel to NIF_VERSION=2.15 pass on prose
+          # while the dependency still requests 2.16.
+          if ! grep -q "^rustler = .*\"$FEATURE\"" Cargo.toml; then
             echo "::error::Cargo.toml does not enable the rustler feature $FEATURE, but archives are labelled nif-${NIF_VERSION}"
             grep -n rustler Cargo.toml || true
             exit 1
@@ -282,6 +291,37 @@ jobs:
             ls -la native/tyrex/target/$TARGET/release/ || true
             exit 1
           fi
+
+          # The grep in "Build the NIF" proves what the manifest *requests*; this
+          # proves what the file about to be tarred was *built* with, which is
+          # what the archive name claims. rustler stamps min_erts() into the NIF
+          # entry struct (rustler-0.38.0 src/codegen_runtime.rs), so the string
+          # below is present iff the feature was on when this .so was compiled —
+          # and the build runs after a Swatinem/rust-cache restore, which can
+          # hand back an artifact compiled before the feature was set.
+          case "$NIF_VERSION" in
+            2.15) MIN_ERTS="OTP-22.0" ;;
+            2.16) MIN_ERTS="OTP-24.0" ;;
+            2.17) MIN_ERTS="OTP-26.0" ;;
+            2.18) MIN_ERTS="OTP-29.0" ;;
+            *)
+              echo "::error::No rustler min_erts mapping for NIF $NIF_VERSION; add it from rustler's codegen_runtime.rs"
+              exit 1
+              ;;
+          esac
+
+          if command -v strings >/dev/null 2>&1; then
+            FOUND=$(strings -a "$SRC" | grep -c -x "$MIN_ERTS" || true)
+          else
+            # strings(1) comes from binutils and is not guaranteed on a runner.
+            # grep -a over the binary answers the same question everywhere.
+            FOUND=$(LC_ALL=C grep -a -c -- "$MIN_ERTS" "$SRC" || true)
+          fi
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::error::$SRC does not embed min_erts $MIN_ERTS, so it was not built against NIF ${NIF_VERSION} — refusing to package it under that label"
+            exit 1
+          fi
+          echo "$SRC embeds min_erts $MIN_ERTS (NIF ${NIF_VERSION})"
 
           # RustlerPrecompiled expects the file inside the tar to be named
           # libtyrex-v{version}-nif-{nif_version}-{target}.so (always .so)
@@ -392,31 +432,66 @@ jobs:
         with:
           files: /tmp/nif-archives/*.tar.gz
 
-      # Deliberately after the release step. checksum-Elixir.Tyrex.Native.exs is
-      # packaged into the Hex tarball, and RustlerPrecompiled resolves the
-      # artifact name and raises on a missing entry before it ever reaches the
-      # network — so a stale file breaks all four precompiled targets identically
-      # (v0.4.0 was cut while the file still held only v0.3.0 entries, and
-      # nothing in the repo regenerated it). CI cannot fix it: the checksums are
-      # of the archives the step above just uploaded, and CI must not commit.
-      # Gating it before the release would deadlock, because the file can only be
-      # generated from a release that does not exist yet. Failing after is safe:
-      # attaching archives to a GitHub release is idempotent and reversible,
-      # whereas `mix hex.publish` is not — and nothing in CI runs that. So a red
-      # job here is exactly the forcing function, and it lands at the one moment
-      # when the regeneration command can actually succeed.
-      - name: Verify the checksum file covers this version
+      # Deliberately after the release step, and deliberately not a failure.
+      #
+      # checksum-Elixir.Tyrex.Native.exs is packaged into the Hex tarball, and
+      # RustlerPrecompiled resolves the artifact name and raises on a missing
+      # entry before it ever reaches the network — so a stale file breaks all
+      # four precompiled targets identically (v0.4.0 was cut while the file still
+      # held only v0.3.0 entries, and nothing in the repo regenerated it).
+      #
+      # The ordering is forced: the checksums are of the archives the step above
+      # just uploaded, so gating before the release would deadlock, and CI must
+      # not commit. Attaching archives is idempotent, `mix hex.publish` is the
+      # irreversible step, and CI never runs it.
+      #
+      # What this step is NOT is a gate, because it cannot be one: this job
+      # checks out the tag, and the commit carrying the checksums is by
+      # construction a later commit, so `exit 1` here would make every
+      # successful release end red and a re-run fail identically — destroying the
+      # signal from the tag guard and the archive-count guard above. The real
+      # gate is local: `assert_checksums_current!/0` in mix.exs aborts
+      # `mix hex.publish`. So this reports, and reports where the maintainer is
+      # already looking.
+      - name: Report whether the checksum file covers this version
         shell: bash
         run: |
           FILE=checksum-Elixir.Tyrex.Native.exs
-          if ! grep -q -- "-v${PROJECT_VERSION}-nif-" "$FILE"; then
-            echo "::error::$FILE has no v${PROJECT_VERSION} entries — do NOT run mix hex.publish yet"
-            echo "The v${PROJECT_VERSION} release and its four archives ARE published; nothing is missing on GitHub."
-            echo "The remaining step is local and manual. Run it now that the release exists:"
-            echo "  TYREX_BUILD=true mix rustler_precompiled.download Tyrex.Native --all --print"
-            echo "  (wired up as: TYREX_BUILD=true mix checksums.after_release)"
-            echo "then commit the regenerated $FILE and only then run mix hex.publish."
-            exit 1
+          # All four, not one matching line: RustlerPrecompiled looks up the
+          # single entry for the consumer's own platform, so a file regenerated
+          # for three of them reads as current and breaks the fourth. Same list
+          # as the build_nif matrix and as mix.exs's @precompiled_targets.
+          TARGETS="aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu"
+          MISSING=""
+          for TARGET in $TARGETS; do
+            ENTRY="libtyrex-v${PROJECT_VERSION}-nif-${NIF_VERSION}-${TARGET}.so.tar.gz"
+            grep -qF -- "$ENTRY" "$FILE" 2>/dev/null || MISSING="$MISSING $TARGET"
+          done
+
+          if [ -z "$MISSING" ]; then
+            echo "$FILE covers all four v${PROJECT_VERSION} targets:"
+            grep -- "-v${PROJECT_VERSION}-nif-${NIF_VERSION}-" "$FILE"
+            exit 0
           fi
-          echo "$FILE covers v${PROJECT_VERSION}:"
-          grep -- "-v${PROJECT_VERSION}-nif-" "$FILE"
+
+          echo "::notice::$FILE has no v${PROJECT_VERSION} nif-${NIF_VERSION} entries for:$MISSING — regenerate and commit it before running mix hex.publish"
+          {
+            echo "## Release published — one local step remains"
+            echo
+            echo "The \`v${PROJECT_VERSION}\` release and its four archives **are published**."
+            echo "Nothing is missing on GitHub, and nothing here needs re-running."
+            echo
+            echo "\`$FILE\` has no \`v${PROJECT_VERSION}\` \`nif-${NIF_VERSION}\` entries for:"
+            for TARGET in $MISSING; do echo "- \`$TARGET\`"; done
+            echo
+            echo "CI cannot fill them in: the checksums are of the archives this job just"
+            echo "uploaded, and CI must not commit. Run this locally, now that the release exists:"
+            echo
+            echo '```bash'
+            echo "TYREX_BUILD=true mix checksums.after_release"
+            echo "# runs: mix rustler_precompiled.download Tyrex.Native --all --print"
+            echo '```'
+            echo
+            echo "Then commit the regenerated \`$FILE\` and only then run \`mix hex.publish\`,"
+            echo "which refuses to publish until all four entries are present."
+          } >> "$GITHUB_STEP_SUMMARY"

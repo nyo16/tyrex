@@ -8,5 +8,6 @@ rustler::atoms! {
     heap_limit_error,
     promise_rejection,
     timeout,
+    worker_panicked,
     ok,
 }

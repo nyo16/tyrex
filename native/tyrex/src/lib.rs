@@ -19,10 +19,17 @@ fn start_runtime(
     max_heap_mb: Option<u64>,
 ) -> rustler::Atom {
     let task_pid = env.pid();
-    let runtime_id = runtimes::lock_or_recover().insert(pid);
+    // Owns the slab entry for the whole life of the worker thread and removes it
+    // exactly once, on drop — including while unwinding. See `runtimes::Registration`.
+    let registration = runtimes::Registration::insert(pid);
+    let runtime_id = registration.id();
     let (worker_sender, worker_receiver) =
         tokio::sync::mpsc::unbounded_channel::<worker::Message>();
     std::thread::spawn(move || {
+        // Moved in so the slab entry lives exactly as long as this thread, and is
+        // removed by its Drop on every exit path including an unwind. Nothing
+        // else may call `try_remove` for this id.
+        let _registration = registration;
         let tokio_rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -40,7 +47,6 @@ fn start_runtime(
                         },
                     ),
                 );
-                runtimes::lock_or_recover().try_remove(runtime_id);
                 return;
             }
         };
@@ -62,6 +68,26 @@ fn start_runtime(
         // promise slab, and dropping a `oneshot::Sender` without sending makes
         // its receiver fail, which both `eval` and `eval_blocking` report as
         // `:dead_runtime_error`.
+        //
+        // The boundary is narrower than it looks. This contains panics raised
+        // in pure Rust frames under `block_on` — which is what the `serde_v8`
+        // unwraps are. It does *not* contain a panic raised inside a function
+        // V8 calls through an `extern "C"` trampoline: `op_apply`, the
+        // `PermissionedModuleLoader` hooks (V8's dynamic-import host callback)
+        // and the near-heap-limit closure
+        // (`deno_core-0.391.0/runtime/jsruntime.rs:2619-2631`). Unwinding out
+        // of `extern "C"` is `panic_cannot_unwind`, which aborts the OS
+        // process before any handler runs — the `new Worker(...)` abort that
+        // forced `delete globalThis.Worker` (see `worker::new`) was exactly
+        // that shape, and no wrapper anywhere could have caught it. Those
+        // callbacks have to be panic-free at the source.
+        //
+        // Teardown has three distinct paths and none subsumes the others:
+        // `Runtime::drop` when the last reference goes away, `Resource::down`
+        // when the owning GenServer dies while a reference is still pinned in a
+        // parked NIF frame, and this `catch_unwind` when the worker thread
+        // itself unwinds. See `runtime.rs` for why the first two are both
+        // needed.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio_rt.block_on(async {
                 match worker::new(
@@ -78,23 +104,33 @@ fn start_runtime(
                         // is no way to interrupt a guest that never yields — this
                         // thread is the one burning CPU, so it cannot rescue itself.
                         let isolate_handle = handle.isolate_handle.clone();
-                        util::send_to_pid(
-                            &task_pid,
-                            (
-                                atoms::ok(),
-                                ResourceArc::new(runtime::Runtime {
-                                    worker_sender,
-                                    isolate_handle,
-                                }),
-                            ),
-                        );
+                        let resource = ResourceArc::new(runtime::Runtime {
+                            worker_sender,
+                            isolate_handle,
+                        });
+                        // Monitor the owning GenServer. `Runtime::drop` alone does
+                        // not cover a brutally killed owner: under `blocking: true`
+                        // that process is parked inside `eval_blocking` holding a
+                        // `ResourceArc` in its NIF frame, so the refcount never
+                        // reaches zero and the worker thread spins forever.
+                        // `Resource::down` fires on process death whatever the
+                        // process was executing, which is the only hook that
+                        // reaches that case. `pid` is the GenServer; `task_pid` is
+                        // the short-lived Task inside its `init/1`, which exits as
+                        // soon as startup completes and would fire immediately.
+                        if resource.monitor(None, &pid).is_none() {
+                            eprintln!(
+                                "tyrex: could not monitor owner of runtime {runtime_id}; a brutally \
+                                 killed owner will leak this runtime's OS thread"
+                            );
+                        }
+                        util::send_to_pid(&task_pid, (atoms::ok(), resource));
                         startup_reported.set(true);
                         worker::run(runtime_id, handle, worker_receiver).await;
                     }
                     Err(message) => {
                         util::send_to_pid(&task_pid, (atoms::error(), message));
                         startup_reported.set(true);
-                        runtimes::lock_or_recover().try_remove(runtime_id);
                     }
                 }
             })
@@ -103,8 +139,16 @@ fn start_runtime(
         if let Err(payload) = outcome {
             let reason = panic_reason(payload.as_ref());
             eprintln!("tyrex: worker thread for runtime {runtime_id} panicked: {reason}");
-            runtimes::lock_or_recover().try_remove(runtime_id);
-            if !startup_reported.get() {
+            if startup_reported.get() {
+                // Startup succeeded, so the GenServer is alive and holding a
+                // resource whose worker has just gone. Left alone it becomes a
+                // zombie: `Process.alive?` says true, it stays a valid pool
+                // dispatch target, and it answers every call with
+                // `:dead_runtime_error` forever. Tell it, so it can stop and let
+                // its supervisor replace it. `pid` is the GenServer itself, not
+                // the startup Task.
+                util::send_to_pid(&pid, (atoms::worker_panicked(), reason));
+            } else {
                 util::send_to_pid(
                     &task_pid,
                     (

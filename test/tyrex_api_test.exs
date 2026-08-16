@@ -49,6 +49,28 @@ defmodule TyrexApiTest do
 
       Tyrex.stop(pid: pid)
     end
+
+    test "by the server too, for anyone calling the GenServer directly" do
+      {:ok, pid} = Tyrex.start(permissions: :none)
+
+      # `handle_call({:eval, ...})` puts `timeout == :infinity` first in its
+      # `cond` on purpose, but `eval/2` refuses `:infinity` before the call, so
+      # nothing else in the suite reaches that clause — it was defence-in-depth
+      # that no test could see. Delete it and this call dispatches the eval and
+      # then arms its deadline with `Process.send_after(self(), _, :infinity)`,
+      # which raises inside the GenServer: an uncapped runaway thread, which is
+      # exactly what refusing `:infinity` exists to prevent.
+      assert {:error, %Tyrex.Error{name: :unsupported_option, message: message}} =
+               GenServer.call(pid, {:eval, "1 + 1", [timeout: :infinity]}, 5_000)
+
+      assert message =~ "finite :timeout"
+
+      # The guard replied rather than crashing, so the runtime is still serving.
+      assert Process.alive?(pid)
+      assert {:ok, 2} = Tyrex.eval("1 + 1", pid: pid)
+
+      Tyrex.stop(pid: pid)
+    end
   end
 
   describe "a malformed :timeout stays with the caller" do
@@ -98,10 +120,17 @@ defmodule TyrexApiTest do
       Process.sleep(300)
       Tyrex.stop(pid: pid)
 
-      # `terminate/2` used to skip `fail_inflight/2`, so this caller exited with
-      # `:normal` instead — contradicting what `kill/1` documents for the same
-      # situation. An exit here fails the test through `Task.await/2`.
-      assert {:error, %Tyrex.Error{name: :dead_runtime_error}} = Task.await(caller, 10_000)
+      # The `:name` alone cannot fail: `dead_runtime_exit?/1` manufactures
+      # `:dead_runtime_error` from the plain `:normal` exit an *undrained*
+      # caller receives, so deleting `fail_inflight/2` from `terminate/2` left
+      # this green. The `:message` is the only thing that names the producer —
+      # "in flight" comes from `fail_inflight/2` (the runtime replied), while
+      # "already gone" comes from `eval/2`'s `catch` (the caller exited).
+      assert {:error, %Tyrex.Error{name: :dead_runtime_error, message: message}} =
+               Task.await(caller, 10_000)
+
+      assert message =~ "in flight"
+      refute message =~ "already gone"
       refute Process.alive?(pid)
     end
 
@@ -117,7 +146,13 @@ defmodule TyrexApiTest do
       Tyrex.stop(pid: pid)
 
       for caller <- callers do
-        assert {:error, %Tyrex.Error{name: :dead_runtime_error}} = Task.await(caller, 10_000)
+        # Same reasoning as above: the message selects `fail_inflight/2` as the
+        # producer, so an undrained caller laundered by `dead_runtime_exit?/1`
+        # can no longer satisfy this assertion.
+        assert {:error, %Tyrex.Error{name: :dead_runtime_error, message: message}} =
+                 Task.await(caller, 10_000)
+
+        assert message =~ "in flight"
       end
 
       refute Process.alive?(pid)
@@ -195,8 +230,19 @@ defmodule TyrexApiTest do
   describe "the missing-:permissions warning" do
     test "is emitted once per VM" do
       # The warning is one-shot per VM, so any earlier test may have consumed
-      # it. Restore the flag afterwards rather than leaving the next file to
-      # discover a re-armed warning.
+      # it. This test re-arms it by erasing the flag, and therefore owns
+      # putting it back.
+      #
+      # The ordering is load-bearing in two ways, so do not "simplify" either:
+      #
+      #   * `on_exit` rather than a trailing `:persistent_term.put/2` — every
+      #     assertion below can fail, and a restore that never runs leaves the
+      #     warning armed for whatever test starts a runtime next, where it
+      #     lands in an unrelated `with_log`/`capture_log` assertion as a
+      #     surprise extra line.
+      #   * registered *before* the `erase` — if it were registered after, a
+      #     failure between the two would erase without ever queueing the
+      #     restore, which is the same leak by a narrower window.
       on_exit(fn -> :persistent_term.put({Tyrex, :permissions_warned}, true) end)
 
       {{:ok, first}, log} =

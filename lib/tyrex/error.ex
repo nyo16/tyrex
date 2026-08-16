@@ -16,8 +16,9 @@ defmodule Tyrex.Error do
       * `:heap_limit_error` — The guest exceeded the runtime's `:max_heap_mb`
         cap. The isolate was terminated, so the runtime is dead
       * `:unsupported_option` — The requested combination of options cannot be
-        served (e.g. `blocking: true` on a runtime with the `:apply` bridge
-        enabled, which would deadlock)
+        served. Two producers: `blocking: true` on a runtime with the `:apply`
+        bridge enabled, which would deadlock, and `timeout: :infinity` on either
+        eval path, which would arm no deadline at all
     * `:message` - Human-readable error message (optional)
     * `:value` - Additional error value, such as the rejected promise value (optional)
   """

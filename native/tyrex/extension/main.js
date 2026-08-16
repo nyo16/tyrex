@@ -4,10 +4,6 @@ import {op_apply} from "ext:core/ops";
 
 globalThis.Tyrex = {
   _applications: {},
-  _handleApplicationResult: (applicationId, result) => {
-    Tyrex._applications[applicationId].resolve(result);
-    delete Tyrex._applications[applicationId];
-  },
   _applyReply: (applicationId, kind, value) => {
     const entry = Tyrex._applications[applicationId];
     if (!entry) {

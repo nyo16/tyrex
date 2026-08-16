@@ -158,12 +158,30 @@ defmodule TyrexPermissionsTest do
   # permission denial apart from a genuinely missing file.
   describe "dynamic import() respects permissions" do
     setup do
-      dir = Path.join(System.tmp_dir!(), "tyrex_import_#{System.unique_integer([:positive])}")
+      unique = System.unique_integer([:positive])
+      dir = Path.join(System.tmp_dir!(), "tyrex_import_#{unique}")
+      # A sibling directory that no test grants, so it is not merely unlisted but
+      # outside every granted prefix.
+      forbidden = Path.join(System.tmp_dir!(), "tyrex_forbidden_#{unique}")
       File.mkdir_p!(dir)
+      File.mkdir_p!(forbidden)
       File.write!(Path.join(dir, "secret.js"), ~s|export default "SECRET-FROM-DISK";\n|)
       File.write!(Path.join(dir, "secret.json"), ~s|{"secret": "json-secret"}\n|)
-      on_exit(fn -> File.rm_rf!(dir) end)
-      %{dir: dir}
+      File.write!(Path.join(forbidden, "outside.js"), ~s|export default "OUTSIDE-THE-GRANT";\n|)
+
+      # A one-line trampoline: readable, but its static import graph reaches out
+      # of the granted directory.
+      File.write!(
+        Path.join(dir, "trampoline.js"),
+        ~s|import outside from "file://#{Path.join(forbidden, "outside.js")}";\nexport default outside;\n|
+      )
+
+      on_exit(fn ->
+        File.rm_rf!(dir)
+        File.rm_rf!(forbidden)
+      end)
+
+      %{dir: dir, forbidden: forbidden}
     end
 
     test "a file: import is denied under permissions: :none", %{dir: dir} do
@@ -214,6 +232,40 @@ defmodule TyrexPermissionsTest do
                  pid: pid,
                  timeout: 15_000
                )
+
+      Tyrex.stop(pid: pid)
+    end
+
+    test "a dynamically imported file cannot statically import outside the grant", %{
+      dir: dir,
+      forbidden: forbidden
+    } do
+      # The property `PermissionedModuleLoader`'s main-module exemption rests on:
+      # deno propagates `is_dynamic_import` from a `RecursiveModuleLoad` into
+      # every transitive `load`, so the loader's hooks fire for the whole graph of
+      # a guest `import()`, not just its top-level specifier. Narrow the check to
+      # the entry specifier — a plausible "simplification" of the double
+      # resolve/load check, which already reads as redundant — and a guest holding
+      # `allow_read` on one directory regains arbitrary file read by dropping a
+      # trampoline module into it. Every other import test here imports a leaf,
+      # so none of them would notice.
+      {:ok, pid} = Tyrex.start(permissions: [allow_read: [dir]])
+
+      # The entry module itself is readable, so the denial below is about its
+      # dependency and not about the grant failing.
+      assert {:ok, "SECRET-FROM-DISK"} =
+               Tyrex.eval(
+                 ~s|(async () => (await import(#{Jason.encode!("file://" <> Path.join(dir, "secret.js"))})).default)()|,
+                 pid: pid,
+                 timeout: 15_000
+               )
+
+      assert {:ok, message} =
+               import_message(pid, "file://" <> Path.join(dir, "trampoline.js"))
+
+      assert message =~ "Requires read access"
+      assert message =~ Path.join(forbidden, "outside.js")
+      refute message =~ "NOT DENIED"
 
       Tyrex.stop(pid: pid)
     end
@@ -311,13 +363,75 @@ defmodule TyrexPermissionsTest do
       Tyrex.stop(pid: pid)
     end
 
-    test "the underlying op is not reachable even with the global deleted" do
+    # `Deno.core` is `undefined` in EVERY runtime — deno_runtime builds `denoNs`
+    # without a `core` key and exposes the whole of core at
+    # `Deno[Deno.internal].core` instead. The previous version of this test
+    # asserted `typeof Deno?.core?.ops?.op_apply == "undefined"`, which
+    # short-circuits at the first hop and is therefore satisfied by every op
+    # name, including ops that demonstrably exist: `op_read_all` and
+    # `op_base64_encode` both answer `"undefined"` through that chain. It would
+    # have stayed green with `op_apply` fully exposed. These two tests assert
+    # against the namespace deno actually populates.
+    test "op_apply is absent from the real op table with the bridge disabled" do
+      {:ok, pid} = Tyrex.start(permissions: :none)
+
+      # The scenario the old test's title claimed but never built: bridge off,
+      # so the global really is gone.
+      assert {:ok, "undefined"} = Tyrex.eval("typeof globalThis.Tyrex", pid: pid)
+
+      # Positive control, and it is load-bearing. Every assertion below is an
+      # `"undefined"`/absence claim about a property of
+      # `Deno[Deno.internal].core.ops`; if that accessor ever moves again — a
+      # renamed `Deno.internal`, core relocated — the expressions would throw or
+      # answer vacuously and the test would stop measuring anything, which is
+      # exactly the failure being fixed here. So first prove the table is
+      # reachable and populated.
+      assert {:ok, "object"} = Tyrex.eval("typeof Deno[Deno.internal].core.ops", pid: pid)
+
+      assert {:ok, "function"} =
+               Tyrex.eval("typeof Deno[Deno.internal].core.ops.op_base64_encode", pid: pid)
+
+      # The claim itself.
+      assert {:ok, "undefined"} =
+               Tyrex.eval("typeof Deno[Deno.internal].core.ops.op_apply", pid: pid)
+
+      assert {:ok, []} =
+               Tyrex.eval(
+                 ~s|Object.keys(Deno[Deno.internal].core.ops).filter(k => k.startsWith("op_apply"))|,
+                 pid: pid
+               )
+
+      assert_op_table_pinned(pid)
+
+      Tyrex.stop(pid: pid)
+    end
+
+    # The bridge being installed must not put its op on the guest-visible table
+    # either. This is the runtime where `op_apply` genuinely exists, so it is the
+    # interesting half of the pair.
+    test "op_apply is absent from the real op table with the bridge enabled too" do
       {:ok, pid} = Tyrex.start(apply: [{Enum, :sum, 1}])
 
-      # Deno.core is not exposed, so the op cannot be re-acquired directly.
-      assert {:ok, "undefined"} = Tyrex.eval("typeof Deno?.core?.ops?.op_apply", pid: pid)
+      assert {:ok, "object"} = Tyrex.eval("typeof Deno[Deno.internal].core.ops", pid: pid)
 
-      # And ext: modules are structurally unimportable from user code. Only the
+      assert {:ok, "function"} =
+               Tyrex.eval("typeof Deno[Deno.internal].core.ops.op_base64_encode", pid: pid)
+
+      assert {:ok, "undefined"} =
+               Tyrex.eval("typeof Deno[Deno.internal].core.ops.op_apply", pid: pid)
+
+      # The bridge is installed, so this is not "the extension never loaded".
+      assert {:ok, "function"} = Tyrex.eval("typeof Tyrex.apply", pid: pid)
+
+      assert_op_table_pinned(pid)
+
+      Tyrex.stop(pid: pid)
+    end
+
+    test "ext: modules are unimportable, so the bridge module cannot be re-acquired" do
+      {:ok, pid} = Tyrex.start(apply: [{Enum, :sum, 1}])
+
+      # ext: modules are structurally unimportable from user code. Only the
       # name is pinned here: `import()` always returns a promise, so the refusal
       # can only arrive as a rejection, but whether deno_core's resolver or the
       # import permission check refuses first is an internal detail, and either
@@ -445,6 +559,82 @@ defmodule TyrexPermissionsTest do
         Tyrex.start(apply: true)
       end
     end
+
+    # Blocker B5 of the v0.4.0 audit, which shipped fixed but untested:
+    # `op_apply` used to take the runtime id as a JS argument, and a bootstrap
+    # script published it as `Tyrex._runtimeId` on the guest-writable bridge
+    # object. The id selects *which runtime's GenServer* is asked to authorize
+    # the call, so a guest that overwrote it had its `:apply` calls judged
+    # against a sibling runtime's allowlist — a cross-runtime confused deputy in
+    # four lines of JavaScript. The id now lives in per-runtime `OpState` and
+    # `main.js` passes exactly four arguments, none of them an id.
+    test "the runtime id is not exposed to the guest" do
+      {:ok, pid} = Tyrex.start(apply: [{Enum, :sum, 1}])
+
+      assert {:ok, "undefined"} = Tyrex.eval("typeof Tyrex._runtimeId", pid: pid)
+      assert {:ok, "undefined"} = Tyrex.eval("typeof globalThis.Tyrex._runtimeId", pid: pid)
+
+      # The bridge itself is present, so the two assertions above are about the
+      # id being absent rather than about `Tyrex` being absent.
+      assert {:ok, ["_applications", "_applyReply", "apply"]} =
+               Tyrex.eval("Object.keys(globalThis.Tyrex).sort()", pid: pid)
+
+      Tyrex.stop(pid: pid)
+    end
+
+    test "a guest cannot redirect its apply calls to a sibling runtime's allowlist" do
+      # Disjoint allowlists, so any authorization that answers for the wrong
+      # runtime is directly observable: `String.upcase/1` is legal on B and on
+      # nothing else, `Enum.sum/1` is legal on A and on nothing else.
+      {:ok, a} = Tyrex.start(apply: [{Enum, :sum, 1}])
+      {:ok, b} = Tyrex.start(apply: [{String, :upcase, 1}])
+
+      # The write lands — the bridge object is an ordinary extensible object, so
+      # the guest really can set this. What it cannot do is make it mean
+      # anything. If the assignment threw instead, the refusal below would prove
+      # nothing.
+      assert {:ok, "1"} =
+               Tyrex.eval(
+                 ~s|(() => { Tyrex._runtimeId = "1"; globalThis.Tyrex._runtimeId = "1"; return String(Tyrex._runtimeId); })()|,
+                 pid: a
+               )
+
+      # Every id a guest might guess, including B's. The refusal must name
+      # `String.upcase/1`: that is A's allowlist answering, not a generic
+      # failure.
+      for id <- ["0", "1", "2", "3", 0, 1, 2, 3, nil] do
+        assert {:error, %Tyrex.Error{name: :promise_rejection, value: value}} =
+                 Tyrex.eval(
+                   """
+                   (async () => {
+                     Tyrex._runtimeId = #{Jason.encode!(id)};
+                     globalThis.Tyrex._runtimeId = #{Jason.encode!(id)};
+                     return await Tyrex.apply("String", "upcase", ["x"]);
+                   })()
+                   """,
+                   pid: a
+                 )
+
+        assert value =~ "permission_denied",
+               "id #{inspect(id)} was not refused: #{inspect(value)}"
+
+        assert value =~ "String.upcase/1"
+      end
+
+      # And B never saw the call: its own allowlisted function is untouched.
+      assert {:ok, "X"} =
+               Tyrex.eval(~s|(async () => await Tyrex.apply("String", "upcase", ["x"]))()|,
+                 pid: b
+               )
+
+      # A is still serving its own allowlist, so the loop above did not pass by
+      # the bridge being broken on A.
+      assert {:ok, 6} =
+               Tyrex.eval(~s|(async () => await Tyrex.apply("Enum", "sum", [[1,2,3]]))()|, pid: a)
+
+      Tyrex.stop(pid: a)
+      Tyrex.stop(pid: b)
+    end
   end
 
   describe "permissions fail closed" do
@@ -530,6 +720,19 @@ defmodule TyrexPermissionsTest do
       assert_receive {:error, %Tyrex.Error{message: message}}, 30_000
       assert message =~ "must be a string"
     end
+
+    test "allow_all given a list", %{main: main} do
+      # `allow_all` is a baseline switch, not a list of paths. It used to be read
+      # through `matches!(perm, PermValue::True)`, so `allow_all: ["/tmp"]`
+      # silently became `allow_all: false` — fail-closed, so never a hole, but
+      # the one shape this parser reinterpreted instead of refusing. Revert that
+      # exhaustive `match` in `build_permissions` and the runtime starts happily
+      # with a baseline the operator did not ask for.
+      :ok = Tyrex.Native.start_runtime(self(), main, ~s({"allow_all": ["/tmp"]}), false, nil)
+      assert_receive {:error, %Tyrex.Error{message: message}}, 30_000
+      assert message =~ "allow_all must be true or false, not a list"
+      assert message =~ "baseline"
+    end
   end
 
   describe "pool with permissions" do
@@ -575,5 +778,24 @@ defmodule TyrexPermissionsTest do
     """
 
     Tyrex.eval(code, pid: pid, timeout: 15_000)
+  end
+
+  # The op table deno exposes to guest JS, in full. Pinned deliberately: nothing
+  # in tyrex keeps `op_apply` (or any other registered op) off this table —
+  # `deno_core` installs every registered op on `core.ops` unconditionally
+  # (`deno_core-0.391.0/src/runtime/bindings.rs`), and what empties it again is
+  # deno's own `removeImportedOps()`, which keeps a hardcoded `NOT_IMPORTED_OPS`
+  # allowlist and deletes every other key
+  # (`deno_runtime-0.246.0/js/99_main.js:500-556, 968`). The three names below are
+  # that allowlist intersected with what this build registers — deno's list, not
+  # tyrex's. So this is an upstream invariant tyrex neither states nor controls,
+  # and a deno bump that shortened the deletion would be silent without this
+  # assertion. It would expose `op_apply` (still allowlist-checked in Elixir, so
+  # not an escalation on its own) and, worse, `op_import_sync`, which drives a
+  # `LoadInit::Side` load — the one load shape `PermissionedModuleLoader` does not
+  # check, i.e. an unchecked read of any file the BEAM user can read.
+  defp assert_op_table_pinned(pid) do
+    assert {:ok, ["op_base64_encode", "op_napi_open", "op_set_exit_code"]} =
+             Tyrex.eval("Object.keys(Deno[Deno.internal].core.ops).sort()", pid: pid)
   end
 end

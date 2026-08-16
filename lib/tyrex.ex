@@ -265,18 +265,38 @@ defmodule Tyrex do
 
     GenServer.stop(server, reason, timeout)
   catch
-    :exit, _reason ->
-      # The runtime did not shut down in time, or was already gone. Escalate:
-      # a brutal kill drops the last reference to the NIF resource, whose Drop
-      # impl terminates the isolate, so the worker's OS thread is reclaimed
-      # even if the guest never yielded.
-      case GenServer.whereis(server(opts)) do
-        pid when is_pid(pid) -> Process.exit(pid, :kill)
-        _ -> :ok
-      end
+    :exit, exit_reason ->
+      # Only two reasons mean "escalate": the runtime did not shut down in time,
+      # or it was already gone. The previous `catch :exit, _reason` also
+      # swallowed a `terminate/2` that raised and any abnormal stop reason, then
+      # returned `:ok` — so a crashing `terminate/2` was invisible. That is the
+      # same swallow `dead_runtime_exit?/1` was introduced to avoid for `eval/2`;
+      # the two paths now classify consistently.
+      if stop_escalation_reason?(exit_reason) do
+        # A brutal kill is enough. The worker's OS thread is reclaimed by
+        # `Runtime`'s `Resource::down` callback, which fires on owner death
+        # whatever the owner was executing — including parked inside
+        # `eval_blocking`, where `Drop` alone never runs because the NIF frame
+        # still holds a reference. Before that callback existed, this branch
+        # killed the process and leaked the thread: three `blocking: true`
+        # runaways left 3.00 cores burning after `stop/1` returned `:ok`.
+        case GenServer.whereis(server(opts)) do
+          pid when is_pid(pid) -> Process.exit(pid, :kill)
+          _ -> :ok
+        end
 
-      :ok
+        :ok
+      else
+        :erlang.raise(:exit, exit_reason, __STACKTRACE__)
+      end
   end
+
+  # `GenServer.stop/3` wraps the reason as `{reason, {GenServer, :stop, args}}`.
+  defp stop_escalation_reason?({reason, {GenServer, :stop, _args}}),
+    do: stop_escalation_reason?(reason)
+
+  defp stop_escalation_reason?(:timeout), do: true
+  defp stop_escalation_reason?(reason), do: dead_runtime_exit?(reason)
 
   @doc """
   Same as `kill/1`, but it assumes that there is a process with the name
@@ -288,12 +308,12 @@ defmodule Tyrex do
   end
 
   @doc """
-  Interrupt whatever the runtime is executing and shut it down.
+  Interrupt whatever the runtime is executing and shut it down, immediately.
 
-  Unlike `stop/1` this works on a runtime that is wedged inside a guest that
-  never yields — `while (true) {}` cannot be stopped cooperatively, only
-  terminated. Any in-flight `eval` callers receive
-  `{:error, %Tyrex.Error{name: :dead_runtime_error}}`.
+  Unlike `stop/1` this works on a runtime wedged inside a guest that never
+  yields — `while (true) {}` cannot be stopped cooperatively, only terminated —
+  and it does not wait for a graceful shutdown first. Any in-flight `eval`
+  callers receive `{:error, %Tyrex.Error{name: :dead_runtime_error}}`.
 
   Termination is one-way: the runtime is dead afterwards and must be replaced.
 
@@ -303,13 +323,42 @@ defmodule Tyrex do
       Can't be provided if `:pid` is provided.
     * `:pid` - The pid of the Tyrex process. Can't be provided if `:name` is
       provided.
-    * `:timeout` - See `GenServer.call/3`. Defaults to `5_000`.
+    * `:timeout` - How long to wait for the process to actually be gone.
+      Defaults to `5_000`. An untrappable exit does not need a deadline, so
+      reaching it would mean something is very wrong.
   """
   @spec kill(Keyword.t()) :: :ok
   def kill(opts) do
-    GenServer.call(server(opts), :kill, Keyword.get(opts, :timeout, @default_stop_timeout))
-  catch
-    :exit, _reason -> :ok
+    # An untrappable exit, NOT a `GenServer.call`.
+    #
+    # This used to be `GenServer.call(server, :kill)`, which needed the very
+    # message loop a wedged runtime cannot reach — so on the one case the
+    # docstring above promises, it did nothing, waited out its 5s timeout, and
+    # `catch :exit, _ -> :ok` reported that no-op as success. Measured against a
+    # `blocking: true` runaway: `kill/1` returned `:ok` after 5002ms with the
+    # runtime still alive, while `stop/1` on the identical wedge killed it.
+    #
+    # `Process.exit(pid, :kill)` cannot be trapped or deferred, and the worker's
+    # OS thread is reclaimed by `Runtime`'s `Resource::down` callback, which
+    # fires on owner death whatever the owner was executing. Before that
+    # callback existed this route killed the process but leaked the thread.
+    case GenServer.whereis(server(opts)) do
+      pid when is_pid(pid) ->
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+        after
+          Keyword.get(opts, :timeout, @default_stop_timeout) ->
+            Process.demonitor(ref, [:flush])
+            :ok
+        end
+
+      # Already gone, or an unregistered name. Nothing to kill.
+      _ ->
+        :ok
+    end
   end
 
   @doc """
@@ -366,20 +415,31 @@ defmodule Tyrex do
     * `:pid` - The pid of the Tyrex process. Can't be provided if `:name` is
       provided.
     * `:timeout` - Wall-clock deadline in milliseconds for the JavaScript to
-      finish. Must be a positive integer; anything else raises `ArgumentError`
-      in the calling process, so a malformed value cannot reach — and kill —
-      the runtime. Defaults to `5_000`. On expiry the V8 isolate is terminated
-      and `{:error, %Tyrex.Error{name: :timeout}}` is returned; the runtime is
-      dead afterwards.
+      finish. Defaults to `5_000`. On expiry the V8 isolate is terminated and
+      `{:error, %Tyrex.Error{name: :timeout}}` is returned; the runtime is dead
+      afterwards.
 
-  `timeout: :infinity` is refused on both the default and the `blocking: true`
-  path with `{:error, %Tyrex.Error{name: :unsupported_option}}`. An unbounded
-  deadline arms no timer, so a runaway guest burns a per-runtime OS thread at
-  100% for the life of the VM — invisible to BEAM scheduler-utilization
-  monitoring because it is not a dirty scheduler — and through
-  `Tyrex.Pool.eval/3` it permanently consumes a pool slot. Before v0.4.0
-  `:timeout` was only a `GenServer.call/3` timeout, which had that effect by
-  default: the caller gave up and the JavaScript kept running.
+  `:timeout` rejects two different ways, deliberately, and the difference is
+  whether the value is *malformed* or merely *unsupported*:
+
+    * **Malformed raises.** Anything that is not a positive integer within the
+      BEAM's timer range raises `ArgumentError` in the calling process. That is
+      a bug in the caller, in the same class as a bad `:max_heap_mb`, and it
+      raises rather than returning a tuple so it cannot be pattern-matched past
+      and ignored. It also keeps the failure with the caller: `timeout: -1` used
+      to reach the server and raise inside `Process.send_after/3`, killing the
+      runtime.
+    * **`:infinity` returns an error tuple.** `{:error, %Tyrex.Error{name:
+      :unsupported_option}}`, on both the default and the `blocking: true` path.
+      It is a well-formed value that tyrex refuses on policy, not a mistake in
+      the shape of the argument, and the blocking path already answered this way
+      before v0.4.0 — so the tuple is the compatible answer. An unbounded
+      deadline arms no timer, so a runaway guest burns a per-runtime OS thread at
+      100% for the life of the VM — invisible to BEAM scheduler-utilization
+      monitoring because it is not a dirty scheduler — and through
+      `Tyrex.Pool.eval/3` it permanently consumes a pool slot. Before v0.4.0
+      `:timeout` was only a `GenServer.call/3` timeout, which had that effect by
+      default: the caller gave up and the JavaScript kept running.
 
   Evaluating against a runtime that has already terminated — the window every
   deadline, heap trip and `kill/1` opens — returns
@@ -515,12 +575,24 @@ defmodule Tyrex do
     end
   end
 
-  @impl GenServer
-  def handle_call(:kill, _from, state) do
-    :ok = Native.terminate_runtime(state.reference)
-    {:stop, {:shutdown, :killed}, :ok, fail_inflight(state, :dead_runtime_error)}
-  end
-
+  # An allowlisted MFA runs INLINE here, on the runtime's own message loop, so
+  # while it runs this GenServer cannot process its own `{:deadline, from}`
+  # message. A slow bridge call therefore suspends the eval deadline rather than
+  # racing it: measured with an allowlisted function sleeping 6000ms, a caller
+  # with `timeout: 500` exited `{:timeout, {GenServer, :call, ...}}` at ~1504ms
+  # with the runtime still alive, and the runtime was terminated only when the
+  # MFA returned. A pool slot is held throughout.
+  #
+  # This is deliberate and is not being moved. Authorization lives in the
+  # GenServer precisely so it is outside the isolate's blast radius; running the
+  # MFA on a task would move execution away from the process holding that
+  # decision, and would let one guest fan out unbounded concurrent Elixir work.
+  # The honest boundary is therefore documented rather than papered over: bridge
+  # time is not covered by the eval deadline. Keep allowlisted functions fast,
+  # and do slow work by handing it to your own supervised process.
+  #
+  # `blocking: true` is refused with the bridge enabled for the inverse of this
+  # reason — that direction deadlocks outright rather than merely delaying.
   @impl GenServer
   def handle_info({:apply, application_id, module, function_name, args}, state) do
     result = authorize_and_apply(state.apply_allowlist, module, function_name, args)
@@ -582,6 +654,29 @@ defmodule Tyrex do
         state = %{state | inflight: inflight}
         {:stop, {:shutdown, :timeout}, fail_inflight(state, :dead_runtime_error)}
     end
+  end
+
+  # The worker thread unwound. Its `catch_unwind` still ran the slab cleanup, but
+  # this GenServer is left holding a resource with nothing behind it: without
+  # this clause `Process.alive?/1` reports true, a `Tyrex.Pool` keeps dispatching
+  # to it, and every call answers `:dead_runtime_error` forever. Stop so the
+  # supervisor replaces it, and drain anyone already waiting.
+  @impl GenServer
+  def handle_info({:worker_panicked, reason}, state) do
+    Logger.error("Tyrex worker thread panicked, terminating the runtime: #{inspect(reason)}")
+    {:stop, {:shutdown, :dead_runtime_error}, fail_inflight(state, :dead_runtime_error)}
+  end
+
+  # A runtime must not die because something unexpected landed in its mailbox.
+  # Without this clause any stray message — a late `Task` reply from `init/1`
+  # whose `Task.await` had already timed out, a `:DOWN` from a monitor set by
+  # calling code, anything a future deno extension sends — raises
+  # `FunctionClauseError` and takes a working runtime down. Logged rather than
+  # silently dropped, because an unexpected message here is a real signal.
+  @impl GenServer
+  def handle_info(message, state) do
+    Logger.warning("Tyrex runtime received an unexpected message: #{inspect(message)}")
+    {:noreply, state}
   end
 
   @impl GenServer

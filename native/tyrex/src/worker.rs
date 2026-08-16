@@ -36,6 +36,16 @@ fn op_apply(
     // op_apply is reachable from arbitrary JS in the runtime; every input must
     // be tolerated. A missing pid means the runtime is being torn down, which
     // is logged and dropped — never panicked on.
+    //
+    // "Logged" means `eprintln!`, here and at every other diagnostic in this
+    // file: the OS stderr, not `Logger`. A NIF cannot call `Logger`, so a
+    // released app sees these only if it captures the node's stderr, and
+    // otherwise loses them. Routing them to the host means sending a message
+    // to the owning GenServer, which needs a receiving clause on the Elixir
+    // side (`handle_info/2` has no catch-all today, so an unmatched
+    // diagnostic would crash the very runtime it describes). That is a design
+    // decision about a log-forwarding channel, not a cleanup, so it is not
+    // taken here.
     let pid = match slab.get(runtime_id) {
         Some(pid) => pid,
         None => {
@@ -74,25 +84,53 @@ deno_core::extension!(
 /// itself uses: a `file:` specifier is checked against *read* permissions, and
 /// any other scheme against `allow_import`/`deny_import`.
 ///
-/// Static loads are exempt, and deliberately so. `ModuleLoadOptions::is_dynamic_import`
-/// is a property of the whole load — `RecursiveModuleLoad` derives it from
-/// `LoadInit`, so a dynamic `import()` propagates it to every transitive
-/// dependency — which makes it exactly the operator/guest boundary: the main
-/// module named by `:main_module_path` and its static import graph are
-/// operator-supplied and loaded once at bootstrap, whereas `import()` from
-/// eval'd code is guest-supplied. Enforcing on static loads too would break
-/// `Tyrex.start(permissions: :none, main_module_path: ...)`, which is the
-/// documented way to give a locked-down runtime its code.
+/// The exemption is **positive**, not a negative test on deno's flags. Only
+/// loads that happen before `execute_main_module` returns are exempt; after
+/// that, every load is checked whatever deno labels it. That distinction is the
+/// whole point:
+///
+/// `ModuleLoadOptions::is_dynamic_import` alone would be a proxy for the
+/// operator/guest boundary rather than the boundary itself. `deno_core` has a
+/// third load shape, `LoadInit::Side`, which resolves as
+/// `ResolutionKind::Import` with `is_dynamic_import: false`
+/// (`recursive_load.rs:202-204,248`) and is driven by the guest-facing
+/// `op_import_sync` (`ops_builtin.rs:511-523`) — so it would bypass both hooks.
+/// It is unreachable today only because deno's own `removeImportedOps()` strips
+/// that op from `Deno.core.ops`, an upstream invariant tyrex neither states nor
+/// pins. A `bootstrap_complete` latch does not care how a load is labelled or
+/// which ops happen to be exposed, so a deno bump cannot silently reopen this.
+///
+/// The dynamic flags are still consulted, because they catch a guest `import()`
+/// during bootstrap — a main module that dynamically imports at
+/// module-evaluation time is guest-shaped even though the latch is still open.
 struct PermissionedModuleLoader {
     inner: deno_core::FsModuleLoader,
     permissions: deno_runtime::deno_permissions::PermissionsContainer,
+    /// Flipped once, after `execute_main_module` returns. `Cell` is sufficient:
+    /// a `ModuleLoader` is held behind `Rc` on the single worker thread.
+    bootstrap_complete: std::cell::Cell<bool>,
 }
 
 impl PermissionedModuleLoader {
-    fn check_dynamic(
-        &self,
-        specifier: &deno_core::ModuleSpecifier,
-    ) -> Result<(), ModuleLoaderError> {
+    fn new(permissions: deno_runtime::deno_permissions::PermissionsContainer) -> Self {
+        PermissionedModuleLoader {
+            inner: deno_core::FsModuleLoader,
+            permissions,
+            bootstrap_complete: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Closes the operator's static-graph exemption. Everything loaded after
+    /// this point is guest-initiated by definition.
+    fn finish_bootstrap(&self) {
+        self.bootstrap_complete.set(true);
+    }
+
+    fn must_check(&self, is_dynamic: bool) -> bool {
+        is_dynamic || self.bootstrap_complete.get()
+    }
+
+    fn check(&self, specifier: &deno_core::ModuleSpecifier) -> Result<(), ModuleLoaderError> {
         self.permissions
             .check_specifier(
                 specifier,
@@ -120,8 +158,8 @@ impl deno_core::ModuleLoader for PermissionedModuleLoader {
         let is_dynamic = kind == deno_core::ResolutionKind::DynamicImport;
         let resolved = self.inner.resolve(specifier, referrer, kind)?;
 
-        if is_dynamic {
-            self.check_dynamic(&resolved)?;
+        if self.must_check(is_dynamic) {
+            self.check(&resolved)?;
         }
 
         Ok(resolved)
@@ -147,8 +185,8 @@ impl deno_core::ModuleLoader for PermissionedModuleLoader {
         maybe_referrer: Option<&deno_core::ModuleLoadReferrer>,
         options: deno_core::ModuleLoadOptions,
     ) -> deno_core::ModuleLoadResponse {
-        if options.is_dynamic_import {
-            if let Err(err) = self.check_dynamic(module_specifier) {
+        if self.must_check(options.is_dynamic_import) {
+            if let Err(err) = self.check(module_specifier) {
                 return deno_core::ModuleLoadResponse::Sync(Err(err));
             }
         }
@@ -410,10 +448,10 @@ pub async fn new(
         let max_bytes = (mb as usize).saturating_mul(1024 * 1024);
         deno_core::v8::CreateParams::default().heap_limits(0, max_bytes)
     });
-    let module_loader = std::rc::Rc::new(PermissionedModuleLoader {
-        inner: deno_core::FsModuleLoader,
-        permissions: permissions.clone(),
-    });
+    let module_loader = std::rc::Rc::new(PermissionedModuleLoader::new(permissions.clone()));
+    // Kept so the exemption can be closed once the operator's main module has
+    // finished evaluating. Everything loaded after that is guest-initiated.
+    let loader = std::rc::Rc::clone(&module_loader);
     let mut worker = MainWorker::bootstrap_from_options(
         &main_module,
         deno_runtime::worker::WorkerServiceOptions::<
@@ -499,26 +537,52 @@ pub async fn new(
     // unimportable from user code, so the op cannot be re-acquired. Nothing is
     // injected when the bridge is on — the runtime id lives in `OpState`, out of
     // guest reach.
-    let mut bootstrap = String::from("delete globalThis.Worker;");
-    if !apply_enabled {
-        bootstrap.push_str("delete globalThis.Tyrex;");
+    //
+    // Both scripts are compile-time ASCII constants, so `ascii_str!` hands V8
+    // an external one-byte const (`FastString`'s `StaticConst` arm) instead of
+    // the heap-allocated `Owned` arm a built `String` lands in. They stay two
+    // `execute_script` calls rather than one concatenated `String` for exactly
+    // that reason, and each failure now names which seal did not take.
+    let sealed = worker.execute_script(
+        "<anon>",
+        deno_core::ascii_str!("delete globalThis.Worker;").into(),
+    );
+    if let Err(err) = sealed {
+        return Err(startup_error(
+            &mut worker,
+            heap_limit_tripped.as_deref(),
+            format!("could not seal the guest global scope: {err}"),
+        ));
     }
-    worker
-        .execute_script("<anon>", bootstrap.into())
-        .map_err(|err| Error {
-            message: Some(format!("could not seal the guest global scope: {err}")),
-            name: atoms::execution_error(),
-            value: None,
-        })?;
 
-    worker
-        .execute_main_module(&main_module)
-        .await
-        .map_err(|error| Error {
-            message: Some(error.to_string()),
-            name: atoms::execution_error(),
-            value: None,
-        })?;
+    if !apply_enabled {
+        let removed = worker.execute_script(
+            "<anon>",
+            deno_core::ascii_str!("delete globalThis.Tyrex;").into(),
+        );
+        if let Err(err) = removed {
+            return Err(startup_error(
+                &mut worker,
+                heap_limit_tripped.as_deref(),
+                format!("could not remove the disabled Tyrex bridge: {err}"),
+            ));
+        }
+    }
+
+    let evaluated = worker.execute_main_module(&main_module).await;
+
+    // Close the operator's static-graph exemption before returning, on the error
+    // path too: a main module that failed to evaluate must not leave a runtime
+    // whose loader still trusts static loads.
+    loader.finish_bootstrap();
+
+    if let Err(error) = evaluated {
+        return Err(startup_error(
+            &mut worker,
+            heap_limit_tripped.as_deref(),
+            error.to_string(),
+        ));
+    }
 
     Ok(Worker {
         worker,
@@ -585,6 +649,28 @@ fn termination_error(
     }
 }
 
+/// Attribute a failure from one of `worker::new`'s post-bootstrap steps.
+///
+/// The near-heap-limit callback is installed, and its sticky flag live, before
+/// the bootstrap scripts and `execute_main_module` run, so a
+/// `:main_module_path` that blows a tight `:max_heap_mb` trips the cap *here*,
+/// not in `run`. Mapping those errors straight to `execution_error` handed the
+/// operator V8's uninformative post-termination message at `Tyrex.start/1`
+/// with no hint that the cap was what killed it — and the `Worker`, and with
+/// it the flag, is dropped on the error return, so nothing downstream can
+/// recover the attribution.
+fn startup_error(
+    worker: &mut MainWorker,
+    heap_limit_tripped: Option<&std::sync::atomic::AtomicBool>,
+    fallback: String,
+) -> Error {
+    termination_error(worker, heap_limit_tripped).unwrap_or_else(|| Error {
+        message: Some(fallback),
+        name: atoms::execution_error(),
+        value: None,
+    })
+}
+
 pub async fn run(
     runtime_id: usize,
     handle: Worker,
@@ -608,7 +694,6 @@ pub async fn run(
                         // whose oneshot receiver is dropped immediately, so this
                         // send routinely fails on benign teardown. Silently OK.
                         let _ = response_sender.send(());
-                        runtimes::lock_or_recover().try_remove(runtime_id);
                         drain_pending_promises(&mut promises);
                         break;
                     },
@@ -643,8 +728,7 @@ pub async fn run(
                             );
                         }
                         if termination_error(&mut worker, heap_limit_tripped.as_deref()).is_some() {
-                            runtimes::lock_or_recover().try_remove(runtime_id);
-                            drain_pending_promises(&mut promises);
+                                drain_pending_promises(&mut promises);
                             break;
                         }
                         poll_event_loop = true;
@@ -716,8 +800,7 @@ pub async fn run(
                             }
                         };
                         if terminated {
-                            runtimes::lock_or_recover().try_remove(runtime_id);
-                            drain_pending_promises(&mut promises);
+                                drain_pending_promises(&mut promises);
                             break;
                         }
                         poll_event_loop = true;
@@ -729,14 +812,12 @@ pub async fn run(
                 // spin here forever: `poll_event_loop` on a terminated isolate
                 // returns Ready(Err) immediately, every time.
                 if termination_error(&mut worker, heap_limit_tripped.as_deref()).is_some() {
-                    runtimes::lock_or_recover().try_remove(runtime_id);
                     drain_pending_promises(&mut promises);
                     break;
                 }
                 poll_event_loop = false;
             },
             else => {
-                runtimes::lock_or_recover().try_remove(runtime_id);
                 drain_pending_promises(&mut promises);
                 break;
             }
