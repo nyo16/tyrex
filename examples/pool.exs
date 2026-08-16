@@ -4,7 +4,7 @@
 IO.puts("=== Tyrex Pool Examples ===\n")
 
 # Start a pool with 4 runtimes
-{:ok, _} = Tyrex.Pool.start_link(name: :my_pool, size: 4)
+{:ok, _} = Tyrex.Pool.start_link(name: :my_pool, size: 4, permissions: :none)
 
 # Basic eval
 {:ok, result} = Tyrex.Pool.eval(:my_pool, "2 + 2")
@@ -29,6 +29,7 @@ Supervisor.stop(:"my_pool.Supervisor")
   Tyrex.Pool.start_link(
     name: :sticky_pool,
     size: 4,
+    permissions: :none,
     strategy: Tyrex.Pool.Strategy.Hash
   )
 
@@ -45,7 +46,7 @@ IO.puts("\nSticky session - user_abc visited #{visits} times")
 Supervisor.stop(:"sticky_pool.Supervisor")
 
 # Concurrent pool usage
-{:ok, _} = Tyrex.Pool.start_link(name: :conc_pool, size: 4)
+{:ok, _} = Tyrex.Pool.start_link(name: :conc_pool, size: 4, permissions: :none)
 
 tasks =
   for i <- 1..20 do

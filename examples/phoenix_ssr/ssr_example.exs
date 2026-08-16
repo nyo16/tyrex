@@ -3,11 +3,17 @@
 
 IO.puts("=== Tyrex SSR Example ===\n")
 
-# Start a pool for SSR
+# Start a pool for SSR.
+#
+# `permissions: :none` is right for SSR: rendering is pure computation, so the
+# guest needs no filesystem, network or env access. The main module is loaded at
+# bootstrap and is exempt from read permissions, which is why it still resolves
+# under `:none`.
 {:ok, _} =
   Tyrex.Pool.start_link(
     name: :ssr_pool,
     size: 2,
+    permissions: :none,
     main_module_path: "examples/phoenix_ssr/server.js"
   )
 

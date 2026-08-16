@@ -8,7 +8,9 @@
 IO.puts("=== Tyrex Error Handling Examples ===\n")
 
 # --- A "happy path" runtime for most demos ----------------------------------
-{:ok, pid} = Tyrex.start()
+# `:permissions` is explicit because v0.4.0 made `:none` the default and
+# omitting it logs a one-time upgrade warning.
+{:ok, pid} = Tyrex.start(permissions: :none)
 
 # --- 1. Syntax / reference error -> :execution_error ------------------------
 IO.puts("1) Syntax error (:execution_error)")

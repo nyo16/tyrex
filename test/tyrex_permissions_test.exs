@@ -637,6 +637,59 @@ defmodule TyrexPermissionsTest do
     end
   end
 
+  # Deno's permission model does not govern file descriptors 0/1/2 at all, so
+  # these are tyrex's own decision rather than a permission outcome. The split is
+  # asymmetric on purpose and the asymmetry is the thing worth pinning: an
+  # attempt to "make :none consistent" by also piping stdout would break
+  # `console.log` for no security gain, because `console.log` does not use these
+  # rids — it reaches `op_print`, which writes to the process's stdout directly.
+  describe "the host's standard streams" do
+    test "guest stdin is closed, so it cannot read the host's stdin" do
+      {:ok, pid} = Tyrex.start(permissions: :none)
+
+      # EOF, not an error: stdin is a real handle pointed at the null device, so
+      # a guest reading it gets nothing rather than something it can distinguish
+      # from an empty pipe. On an attached `iex` this would otherwise be the
+      # operator's keyboard.
+      read = """
+      (() => {
+        try {
+          const buf = new Uint8Array(8);
+          return "READ " + String(Deno.stdin.readSync(buf));
+        } catch (e) {
+          return "ERR " + String(e && e.name ? e.name : e);
+        }
+      })()
+      """
+
+      assert {:ok, "READ null"} = Tyrex.eval(read, pid: pid)
+
+      Tyrex.stop(pid: pid)
+    end
+
+    test "guest output still reaches the host, which the docs disclose" do
+      {:ok, pid} = Tyrex.start(permissions: :none)
+
+      # Not a capability tyrex can withdraw, and the tests say so rather than
+      # leaving a future reader to assume `:none` covers it. If this ever starts
+      # failing, either deno changed `op_print` or someone piped stdout — and in
+      # the second case `console.log` broke, which is the thing to reconsider.
+      assert {:ok, "ok"} =
+               Tyrex.eval(~s|(() => { console.log("tyrex test probe"); return "ok"; })()|,
+                 pid: pid
+               )
+
+      write =
+        "(() => { try { return \"WROTE \" + " <>
+          "Deno.stdout.writeSync(new TextEncoder().encode(\"tyrex test probe\")); } " <>
+          "catch (e) { return \"ERR \" + String(e); } })()"
+
+      assert {:ok, "WROTE 16"} = Tyrex.eval(write, pid: pid)
+
+      Tyrex.stop(pid: pid)
+    end
+  end
+
   describe "permissions fail closed" do
     test "an explicit allow_x: false denies even under allow_all: true" do
       {:ok, pid} = Tyrex.start(permissions: [allow_all: true, allow_run: false])

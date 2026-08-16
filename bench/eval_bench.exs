@@ -1,7 +1,7 @@
 # Run: TYREX_BUILD=true mix run bench/eval_bench.exs
 
-{:ok, pid} = Tyrex.start()
-{:ok, _} = Tyrex.Pool.start_link(name: :bench_pool, size: 4)
+{:ok, pid} = Tyrex.start(permissions: :none)
+{:ok, _} = Tyrex.Pool.start_link(name: :bench_pool, size: 4, permissions: :none)
 
 Benchee.run(
   %{

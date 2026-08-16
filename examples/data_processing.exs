@@ -3,7 +3,7 @@
 
 IO.puts("=== Tyrex Data Processing Examples ===\n")
 
-{:ok, pid} = Tyrex.start(main_module_path: "examples/data_processing.js")
+{:ok, pid} = Tyrex.start(permissions: :none, main_module_path: "examples/data_processing.js")
 
 # CSV parsing
 csv = "name,age,city\nAlice,30,NYC\nBob,25,LA\nCharlie,35,Chicago"

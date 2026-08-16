@@ -375,10 +375,15 @@ model-authored JavaScript:
   module named by `:main_module_path` and its static imports load regardless of
   `:permissions` — see [Dynamic `import()` vs. the main
   module](#dynamic-import-vs-the-main-module).
-- **stdio is inherited from the host process and is not permissioned.** Deno's
-  permission model does not govern file descriptors 0/1/2, so guest code under
-  `permissions: :none` can write to the node's stdout — forging log lines — and
-  read its stdin, which on an attached `iex` is the operator's keyboard.
+- **Guest output reaches the host's stdout, and cannot be prevented.** `console.log`
+  does not go through the permissioned resource table — it reaches deno's
+  `op_print`, which writes to the process's own stdout directly. So guest code
+  under `permissions: :none` can write to your logs and forge log records. This
+  is inherent to embedding a JS runtime in-process; no permission closes it. If
+  you parse your logs, do not trust guest-influenced lines.
+  Guest **input** is closed: stdin is pointed at the null device, so
+  `Deno.stdin.readSync` returns EOF rather than reading the host's stdin, which
+  on an attached `iex` would be the operator's keyboard.
 
 If you need a hard security boundary for code you do not control, run Deno
 out-of-process: a separate OS process you can confine with the operating system

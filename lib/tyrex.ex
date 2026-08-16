@@ -162,10 +162,13 @@ defmodule Tyrex do
   Control what Deno I/O the JavaScript runtime can perform:
 
     * `:none` — No permissioned Deno I/O (default). JavaScript can compute, but
-      not read files, open sockets, read env, or spawn processes. It does **not**
-      cover stdio: file descriptors 0/1/2 are inherited from the host OS process
-      and Deno's permission model does not govern them, so guest code can still
-      write to the node's stdout and read its stdin.
+      not read files, open sockets, read env, or spawn processes. Two caveats it
+      does **not** cover, both about the host's standard streams: guest
+      `console.log` reaches the host's stdout directly through deno's
+      `op_print`, bypassing the permission model entirely, so guest code can
+      write to your logs and no permission prevents it. Guest stdin, by
+      contrast, is closed — it is pointed at the null device, so
+      `Deno.stdin.readSync` returns EOF instead of reading the host's stdin.
     * `:allow_all` — Full access to everything.
     * Keyword list — Granular control per permission type.
 

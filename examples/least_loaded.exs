@@ -43,7 +43,7 @@ end
 IO.puts("=== Tyrex Least-Loaded Pool Strategy ===\n")
 
 size = 4
-{:ok, _} = Tyrex.Pool.start_link(name: :ll_pool, size: size, strategy: LeastLoaded)
+{:ok, _} = Tyrex.Pool.start_link(name: :ll_pool, size: size, permissions: :none, strategy: LeastLoaded)
 
 # Tag each runtime so we can attribute calls to it after the fact.
 # Init via the named runtime (NOT the pool) so every runtime gets initialized —

@@ -421,6 +421,55 @@ pub struct Worker {
 /// not just the guest.
 const HEAP_LIMIT_SLACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// Which of the host process's standard streams guest JavaScript inherits.
+///
+/// **stdin is closed; stdout and stderr are inherited.** The asymmetry is
+/// deliberate, and it follows from where each capability actually lives.
+///
+/// Deno's permission model does not govern file descriptors 0/1/2 at all — the
+/// `deno_io` extension registers them as rids 0/1/2 from `Stdio::default()`,
+/// which inherits. Correct for a CLI; wrong for a runtime embedded in someone
+/// else's OS process. Under `permissions: :none`, guest JS could read the host's
+/// stdin, which on an attached `iex` is the operator's keyboard. Nothing wants
+/// that, so it is pointed at `/dev/null` and `Deno.stdin.readSync` returns EOF.
+///
+/// Output is a different case and is NOT closed, because closing it would be
+/// theatre. `console.log` does not go through these rids: it reaches
+/// `op_print`, which writes to Rust's own `stdout()` directly
+/// (`deno_core-0.391.0/ops_builtin.rs:219-231`). Piping rid 1 would therefore
+/// stop `Deno.stdout.writeSync` while leaving a guest perfectly able to forge
+/// host output through `console.log` — half a fix, at the cost of the most
+/// useful debugging affordance JavaScript has. Output forging is inherent to
+/// embedding a JS runtime in-process and is documented as such rather than
+/// papered over.
+///
+/// If the null device cannot be opened, inherit rather than refuse to start: a
+/// runtime that boots with an unexpectedly readable stdin is worse than no
+/// runtime only if the operator is not told, and this is logged.
+fn guest_stdio() -> deno_runtime::deno_io::Stdio {
+    let stdin = match std::fs::OpenOptions::new().read(true).open(NULL_DEVICE) {
+        Ok(file) => deno_runtime::deno_io::StdioPipe::file(file),
+        Err(err) => {
+            eprintln!(
+                "tyrex: could not open {NULL_DEVICE} to close the guest's stdin ({err}); \
+                 guest JavaScript will inherit the host's stdin"
+            );
+            deno_runtime::deno_io::StdioPipe::inherit()
+        }
+    };
+
+    deno_runtime::deno_io::Stdio {
+        stdin,
+        stdout: deno_runtime::deno_io::StdioPipe::inherit(),
+        stderr: deno_runtime::deno_io::StdioPipe::inherit(),
+    }
+}
+
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+
 pub async fn new(
     runtime_id: usize,
     main_module_path: String,
@@ -478,6 +527,7 @@ pub async fn new(
         deno_runtime::worker::WorkerOptions {
             extensions: vec![extension::init(runtime_id)],
             create_params,
+            stdio: guest_stdio(),
             ..Default::default()
         },
     );
