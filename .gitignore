@@ -28,3 +28,8 @@ tyrex-*.tar
 # Compiled NIF binaries
 /priv/native/
 
+
+# Per-developer Claude tool permissions, not a project setting.
+.claude/settings.local.json
+# Generated intermediates: verbatim copies of the plan the reviewer was fed.
+.claude/plans/*/reviews/.requirements-input.md
