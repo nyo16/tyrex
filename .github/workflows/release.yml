@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - master
+    # `paths` narrows the *branch* half of this trigger only: GitHub does not
+    # evaluate path filters for pushes of tags ("Path filters are not evaluated
+    # for pushes of tags", Actions docs, *Triggering a workflow*). So a release
+    # tag on a commit that touches nothing under native/ still builds — which is
+    # the case that matters, since the `publish` job below only runs on tags.
     paths:
       - "native/**"
       - ".github/workflows/release.yml"
@@ -16,6 +21,16 @@ on:
 
 env:
   V8_TAG: "v146.4.0"
+  # The NIF level *label* — not a switch. It is the value asserted in the
+  # packaged archive name ("...-nif-2.16-...") and the bucket for the Rust build
+  # cache key. Nothing reads it to configure a compiler: rustler removed env-var
+  # NIF selection in 0.30, so the erl_nif API level is selected by the
+  # `nif_version_2_16` Cargo feature on the `rustler` dependency in
+  # native/tyrex/Cargo.toml. The two MUST be kept in agreement by hand — a
+  # mismatch ships binaries whose name lies about their ABI, and
+  # RustlerPrecompiled believes the name. The "Build the NIF" step asserts the
+  # agreement so that drift fails the build instead of reaching users.
+  NIF_VERSION: "2.16"
 
 jobs:
   # Build V8 archives with shared-library-compatible TLS model.
@@ -121,13 +136,22 @@ jobs:
   # macOS: uses prebuilt V8 from crates.io (no custom V8 build needed).
   # Linux: uses custom V8 archive from build_v8 job.
   build_nif:
+    # The literal 2.16 is unavoidable here: GitHub Actions does not expose the
+    # `env` context to a job `name:`. Every other occurrence is derived from
+    # env.NIF_VERSION.
     name: NIF 2.16 - ${{ matrix.target }} (${{ matrix.os }})
     needs: [build_v8]
+    # `always()` exists so the Linux legs still reach the guard step below and
+    # report a clear error when build_v8 fails. It does not weaken the release
+    # gate: the guard exits non-zero, so build_nif fails, so the `publish` job
+    # (which has no `always()`) is skipped. Publishing stays all-or-nothing.
     if: always()
     runs-on: ${{ matrix.os }}
 
     permissions:
-      contents: write
+      # No `contents: write` — this job no longer publishes. Releases are cut
+      # by the `publish` job below.
+      contents: read
       id-token: write
       attestations: write
 
@@ -219,17 +243,45 @@ jobs:
 
       # --- Common build steps ---
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v3-precomp
-          shared-key: ${{ matrix.target }}-2.16
-          workspaces: |
-            native/tyrex
+      # Deliberately NOT using Swatinem/rust-cache here. It is unsafe for this
+      # crate, and the failure is silent-then-fatal rather than slow:
+      #
+      # rusty_v8's build script reads RUSTY_V8_ARCHIVE (an out-of-tree file under
+      # /tmp) and emits a `-L` search path into its own OUT_DIR under target/.
+      # rust-cache preserves the build-script *fingerprint* but prunes that
+      # OUT_DIR, so on any run that restores a cache, cargo decides `v8` is
+      # up to date, replays the stale `-L`, and fails with
+      # `could not find native static library rusty_v8`.
+      #
+      # Observed exactly that on this workflow: the first run had no cache, built
+      # `v8` in 12m and passed; the next run restored a full-match cache,
+      # "compiled" `v8` in 2 seconds and died. It arms itself after the first
+      # green run, which means it would have broken the tag build.
+      #
+      # The expensive artifact — librusty_v8.a, 1-2h to build — is cached
+      # separately by actions/cache above and is unaffected. What this costs is
+      # ~12 minutes of crate compilation per leg, in parallel, on a workflow that
+      # runs on tags. That is the right trade for a release build that works.
 
       - name: Build the NIF
         shell: bash
         run: |
           cd native/tyrex
+          # env.NIF_VERSION only labels the archive. What actually fixes the
+          # erl_nif API level is the rustler Cargo feature, so assert the two
+          # agree before building: a silent disagreement here is how you ship a
+          # binary whose filename promises an ABI it was not compiled against.
+          FEATURE="nif_version_${NIF_VERSION//./_}"
+          # Anchored to the dependency line on purpose: the comment block above
+          # it in Cargo.toml contains the literal ["nif_version_2_15"], so an
+          # unanchored grep would let a relabel to NIF_VERSION=2.15 pass on prose
+          # while the dependency still requests 2.16.
+          if ! grep -q "^rustler = .*\"$FEATURE\"" Cargo.toml; then
+            echo "::error::Cargo.toml does not enable the rustler feature $FEATURE, but archives are labelled nif-${NIF_VERSION}"
+            grep -n rustler Cargo.toml || true
+            exit 1
+          fi
+          echo "Building with rustler feature $FEATURE"
           cargo build --release --target ${{ matrix.target }}
 
       - name: Package NIF archive
@@ -253,9 +305,40 @@ jobs:
             exit 1
           fi
 
+          # The grep in "Build the NIF" proves what the manifest *requests*; this
+          # proves what the file about to be tarred was *built* with, which is
+          # what the archive name claims. rustler stamps min_erts() into the NIF
+          # entry struct (rustler-0.38.0 src/codegen_runtime.rs), so the string
+          # below is present iff the feature was on when this .so was compiled —
+          # and the build runs after a Swatinem/rust-cache restore, which can
+          # hand back an artifact compiled before the feature was set.
+          case "$NIF_VERSION" in
+            2.15) MIN_ERTS="OTP-22.0" ;;
+            2.16) MIN_ERTS="OTP-24.0" ;;
+            2.17) MIN_ERTS="OTP-26.0" ;;
+            2.18) MIN_ERTS="OTP-29.0" ;;
+            *)
+              echo "::error::No rustler min_erts mapping for NIF $NIF_VERSION; add it from rustler's codegen_runtime.rs"
+              exit 1
+              ;;
+          esac
+
+          if command -v strings >/dev/null 2>&1; then
+            FOUND=$(strings -a "$SRC" | grep -c -x "$MIN_ERTS" || true)
+          else
+            # strings(1) comes from binutils and is not guaranteed on a runner.
+            # grep -a over the binary answers the same question everywhere.
+            FOUND=$(LC_ALL=C grep -a -c -- "$MIN_ERTS" "$SRC" || true)
+          fi
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::error::$SRC does not embed min_erts $MIN_ERTS, so it was not built against NIF ${NIF_VERSION} — refusing to package it under that label"
+            exit 1
+          fi
+          echo "$SRC embeds min_erts $MIN_ERTS (NIF ${NIF_VERSION})"
+
           # RustlerPrecompiled expects the file inside the tar to be named
           # libtyrex-v{version}-nif-{nif_version}-{target}.so (always .so)
-          NIF_NAME="libtyrex-v${VERSION}-nif-2.16-${TARGET}.so"
+          NIF_NAME="libtyrex-v${VERSION}-nif-${NIF_VERSION}-${TARGET}.so"
           ARCHIVE_NAME="${NIF_NAME}.tar.gz"
 
           TMPDIR=$(mktemp -d)
@@ -296,9 +379,132 @@ jobs:
           name: ${{ steps.package-nif.outputs.file-name }}
           path: ${{ steps.package-nif.outputs.file-path }}
 
+  # Atomic publish. `needs: [build_nif]` with no `always()` means this job runs
+  # only when every matrix leg succeeded, so a release can never contain a
+  # partial set of archives. That matters because RustlerPrecompiled verifies
+  # downloads against checksum-Elixir.Tyrex.Native.exs, which lists all four
+  # targets — a missing archive yields a release that looks complete but is
+  # broken for that target.
+  publish:
+    name: Publish release archives
+    needs: [build_nif]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      # The version guards below read mix.exs and the checksum file, so this job
+      # needs the tree. Nothing here needs history.
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Extract project version
+        shell: bash
+        run: |
+          echo "PROJECT_VERSION=$(sed -n 's/.*@version "\([^"]*\)".*/\1/p' mix.exs | head -n1)" >> $GITHUB_ENV
+
+      # Every archive name takes its v{version} from mix.exs, never from the tag.
+      # Tagging v0.4.1 on a commit whose mix.exs says 0.4.0 attaches four
+      # v0.4.0-named archives to the v0.4.1 release: the count guard below still
+      # passes, and every consumer 404s. Identity before count — a version
+      # mismatch makes the count guard's success meaningless.
+      - name: Verify the tag matches mix.exs
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$TAG" != "v${PROJECT_VERSION}" ]; then
+            echo "::error::Tag $TAG does not match mix.exs @version ${PROJECT_VERSION}; the archives are named v${PROJECT_VERSION}. Expected tag v${PROJECT_VERSION}."
+            exit 1
+          fi
+          echo "Tag $TAG matches mix.exs @version ${PROJECT_VERSION}"
+
+      - name: Download all NIF archives
+        uses: actions/download-artifact@v4
+        with:
+          # Excludes the v8-archive-* artifacts uploaded by build_v8.
+          pattern: libtyrex-*.tar.gz
+          merge-multiple: true
+          path: /tmp/nif-archives
+
+      - name: Verify the full target set is present
+        shell: bash
+        run: |
+          ls -lh /tmp/nif-archives
+          COUNT=$(find /tmp/nif-archives -name '*.tar.gz' -type f | wc -l | tr -d ' ')
+          EXPECTED=4  # must match the build_nif matrix
+          if [ "$COUNT" -ne "$EXPECTED" ]; then
+            echo "::error::Expected $EXPECTED NIF archives, found $COUNT — refusing to publish a partial release"
+            exit 1
+          fi
+
       - name: Publish archives and packages
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ steps.package-nif.outputs.file-path }}
-        if: startsWith(github.ref, 'refs/tags/')
+          files: /tmp/nif-archives/*.tar.gz
+
+      # Deliberately after the release step, and deliberately not a failure.
+      #
+      # checksum-Elixir.Tyrex.Native.exs is packaged into the Hex tarball, and
+      # RustlerPrecompiled resolves the artifact name and raises on a missing
+      # entry before it ever reaches the network — so a stale file breaks all
+      # four precompiled targets identically (v0.4.0 was cut while the file still
+      # held only v0.3.0 entries, and nothing in the repo regenerated it).
+      #
+      # The ordering is forced: the checksums are of the archives the step above
+      # just uploaded, so gating before the release would deadlock, and CI must
+      # not commit. Attaching archives is idempotent, `mix hex.publish` is the
+      # irreversible step, and CI never runs it.
+      #
+      # What this step is NOT is a gate, because it cannot be one: this job
+      # checks out the tag, and the commit carrying the checksums is by
+      # construction a later commit, so `exit 1` here would make every
+      # successful release end red and a re-run fail identically — destroying the
+      # signal from the tag guard and the archive-count guard above. The real
+      # gate is local: `assert_checksums_current!/0` in mix.exs aborts
+      # `mix hex.publish`. So this reports, and reports where the maintainer is
+      # already looking.
+      - name: Report whether the checksum file covers this version
+        shell: bash
+        run: |
+          FILE=checksum-Elixir.Tyrex.Native.exs
+          # All four, not one matching line: RustlerPrecompiled looks up the
+          # single entry for the consumer's own platform, so a file regenerated
+          # for three of them reads as current and breaks the fourth. Same list
+          # as the build_nif matrix and as mix.exs's @precompiled_targets.
+          TARGETS="aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu"
+          MISSING=""
+          for TARGET in $TARGETS; do
+            ENTRY="libtyrex-v${PROJECT_VERSION}-nif-${NIF_VERSION}-${TARGET}.so.tar.gz"
+            grep -qF -- "$ENTRY" "$FILE" 2>/dev/null || MISSING="$MISSING $TARGET"
+          done
+
+          if [ -z "$MISSING" ]; then
+            echo "$FILE covers all four v${PROJECT_VERSION} targets:"
+            grep -- "-v${PROJECT_VERSION}-nif-${NIF_VERSION}-" "$FILE"
+            exit 0
+          fi
+
+          echo "::notice::$FILE has no v${PROJECT_VERSION} nif-${NIF_VERSION} entries for:$MISSING — regenerate and commit it before running mix hex.publish"
+          {
+            echo "## Release published — one local step remains"
+            echo
+            echo "The \`v${PROJECT_VERSION}\` release and its four archives **are published**."
+            echo "Nothing is missing on GitHub, and nothing here needs re-running."
+            echo
+            echo "\`$FILE\` has no \`v${PROJECT_VERSION}\` \`nif-${NIF_VERSION}\` entries for:"
+            for TARGET in $MISSING; do echo "- \`$TARGET\`"; done
+            echo
+            echo "CI cannot fill them in: the checksums are of the archives this job just"
+            echo "uploaded, and CI must not commit. Run this locally, now that the release exists:"
+            echo
+            echo '```bash'
+            echo "TYREX_BUILD=true mix checksums.after_release"
+            echo "# runs: mix rustler_precompiled.download Tyrex.Native --all --print"
+            echo '```'
+            echo
+            echo "Then commit the regenerated \`$FILE\` and only then run \`mix hex.publish\`,"
+            echo "which refuses to publish until all four entries are present."
+          } >> "$GITHUB_STEP_SUMMARY"

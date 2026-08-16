@@ -45,6 +45,15 @@ defmodule Tyrex.Pool do
     * `:strategy` - Dispatch strategy module. Defaults to `Tyrex.Pool.Strategy.RoundRobin`.
     * `:main_module_path` - Path to the main JS module for all runtimes.
     * `:permissions` - Runtime permissions. See `Tyrex.start/1` for details.
+    * `:apply` - Elixir bridge allowlist. See `Tyrex.start/1` for details.
+    * `:max_heap_mb` - Per-runtime V8 heap cap. See `Tyrex.start/1` for details.
+    * `:max_restarts` / `:max_seconds` - Restart intensity for the runtime
+      children. Defaults to `max(size * 4, 12)` restarts in 5 seconds.
+
+  Runtimes are supervised `:one_for_one`, so one runtime hitting its `:timeout`
+  or `:max_heap_mb` cap does not disturb its siblings. The default intensity is
+  deliberately generous because guest code chooses the failure rate: a
+  terminated runtime is ordinary operation here, not a systemic fault.
   """
   @spec start_link(Keyword.t()) :: Supervisor.on_start()
   def start_link(opts) do
@@ -57,7 +66,9 @@ defmodule Tyrex.Pool do
     name = Keyword.fetch!(opts, :name)
     size = Keyword.get(opts, :size, System.schedulers_online())
     strategy_mod = Keyword.get(opts, :strategy, Tyrex.Pool.Strategy.RoundRobin)
-    runtime_opts = Keyword.take(opts, [:main_module_path, :permissions, :startup_timeout])
+
+    runtime_opts =
+      Keyword.take(opts, [:main_module_path, :permissions, :startup_timeout, :apply, :max_heap_mb])
 
     strategy_state = strategy_mod.init(name, size)
 
@@ -81,11 +92,23 @@ defmodule Tyrex.Pool do
         )
       end
 
+    runtime_supervisor =
+      Supervisor.child_spec(
+        {Tyrex.Pool.RuntimeSupervisor,
+         [children: runtime_children, size: size] ++
+           Keyword.take(opts, [:max_restarts, :max_seconds])},
+        id: Tyrex.Pool.RuntimeSupervisor
+      )
+
     # Registry is the FIRST child so it terminates LAST — its terminate/2 then
     # gets to erase the persistent_term entry after all runtimes have stopped.
-    # `:rest_for_one` ensures a Registry crash takes down the runtime children
-    # so the supervisor rebuilds them with a fresh persistent_term entry.
-    Supervisor.init([registry_child | runtime_children], strategy: :rest_for_one)
+    # `:rest_for_one` ensures a Registry crash takes down the runtimes so the
+    # supervisor rebuilds them with a fresh persistent_term entry.
+    #
+    # The runtimes themselves sit one level down, `:one_for_one`, so that a
+    # single guest's deadline or heap trip does not restart its siblings. See
+    # `Tyrex.Pool.RuntimeSupervisor` for why that mattered enough to add a layer.
+    Supervisor.init([registry_child, runtime_supervisor], strategy: :rest_for_one)
   end
 
   @doc """

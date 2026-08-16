@@ -66,7 +66,11 @@ else
         https://github.com/denoland/rusty_v8.git /v8build
       cd /v8build
 
-      # Set up cross-compilation cargo config for arm64
+      # Set up cross-compilation cargo config for arm64. This writes
+      # /v8build/.cargo/config.toml, which belongs to the rusty_v8 clone, not to
+      # tyrex. This container never sees the repo (only the archive dir is
+      # mounted), so it cannot touch native/tyrex/.cargo/config.toml, the musl
+      # -crt-static file that mix.exs packages.
       if [ "$RUST_TARGET" = "aarch64-unknown-linux-gnu" ]; then
         mkdir -p .cargo
         printf "[target.aarch64-unknown-linux-gnu]\nlinker = \"aarch64-linux-gnu-gcc\"\n" > .cargo/config.toml
@@ -120,7 +124,6 @@ docker run --rm \
   -e CARGO_HOME=/cargo \
   -e RUSTUP_HOME=/rustup \
   -e "RUSTY_V8_ARCHIVE=/v8-archives/librusty_v8_${TARGET}.a" \
-  -e RUSTLER_NIF_VERSION=2.16 \
   ubuntu:24.04 bash -exc '
     cp -a /build/native/tyrex/* /work/
     cp -a /build/native/tyrex/.cargo /work/ 2>/dev/null || true

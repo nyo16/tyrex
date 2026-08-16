@@ -1,5 +1,177 @@
 # Changelog
 
+## v0.4.0 (2026-08-14)
+
+Security and lifecycle release. Two independent reviews — an internal audit and
+a downstream integrator reading the same commit — found the same two defects:
+the `Tyrex.apply` bridge was an unrestricted Elixir gateway installed
+unconditionally, and there was no way to stop a runaway program. Both are
+closed here.
+
+### Changed
+
+**Breaking: `:permissions` now defaults to `:none` instead of `:allow_all`.**
+Existing code loses Deno I/O with no compile error. Migration is one line:
+
+```elixir
+Tyrex.start(permissions: :allow_all)
+```
+
+A one-time `Logger.warning` is emitted when `:permissions` is omitted.
+
+**Breaking: the `Tyrex.apply` JS→Elixir bridge is now opt-in and allowlisted.**
+It was installed unconditionally and consulted no permissions at all, so under
+`permissions: :none` Deno's own `readTextFileSync` was correctly denied while
+the bridge still delivered `File.read!` and shell execution via `:os.cmd`. The
+new `:apply` option takes `false` (the default) or an explicit MFA allowlist:
+
+```elixir
+Tyrex.start(apply: [{Enum, :sum, 1}, {String, :upcase, 1}])
+```
+
+With the bridge disabled, `globalThis.Tyrex` is deleted after bootstrap, so
+guest code holds no reference to it. There is deliberately no `apply: true`.
+Enforcement lives in the GenServer, not in JavaScript, and an unexported MFA is
+rejected at start rather than at first call.
+
+- `:timeout` on `eval/2` is now a real wall-clock deadline. It was previously
+  only a `GenServer.call/3` timeout: the caller gave up and the JavaScript kept
+  running. On expiry the V8 isolate is terminated and `{:error,
+  %Tyrex.Error{name: :timeout}}` is returned. The `GenServer.call` timeout is the
+  deadline plus a 1s grace, which covers scheduler jitter — but not GenServer
+  *occupancy*: `arm_deadline/3` runs inside `handle_call`, so a caller queued
+  behind a blocking eval has no deadline armed while its own call timeout runs
+  out, and still exits `:timeout` rather than receiving an error tuple.
+- Termination is a one-way door: a runtime that hits its deadline or heap cap
+  is dead and is replaced, never reused. V8 termination is uncatchable and
+  sticky, so a "recovered" isolate would be a silent brick.
+- `stop/1`'s `:timeout` now defaults to `5_000` instead of `:infinity`, and
+  escalates to a kill rather than hanging forever on a wedged runtime.
+- `eval_blocking` moved from `DirtyCpu` to `DirtyIo` — it parks on a channel,
+  which is I/O-shaped waiting, not compute.
+- `blocking: true` is now refused with `:unsupported_option` when the `:apply`
+  bridge is enabled, or when `:timeout` is `:infinity`.
+- Aligned the rustler pair: Elixir `~> 0.38.0` and the Rust crate `=0.38.0`, the
+  latter pinned with `=` and carrying the `nif_version_2_16` feature. Note only
+  those are pinned: the `NIF_VERSION` label in the release workflow and the
+  `nif_versions:` list in `lib/tyrex/native.ex` are kept in agreement by hand.
+
+### Added
+
+- `Tyrex.kill/0,1` — interrupt a runtime that is wedged inside a guest that
+  never yields. `while (true) {}` cannot be stopped cooperatively, only
+  terminated.
+- `:max_heap_mb` option capping the V8 heap. Without it a guest that exhausts
+  memory `abort()`s the entire BEAM; with it the guest is terminated and the
+  caller gets `%Tyrex.Error{name: :heap_limit_error}`.
+- New `Tyrex.Error` names: `:timeout`, `:heap_limit_error`,
+  `:unsupported_option`.
+- `Tyrex.Native.terminate_runtime/1`, and `@spec`s on all NIF stubs (there were
+  none).
+- `Tyrex.Pool` forwards `:apply` and `:max_heap_mb` to every runtime.
+
+### Fixed
+
+- **Dynamic `import()` bypassed every read permission, and `deny_import` was
+  inert.** Under `permissions: :none`, `Deno.readTextFileSync("/etc/passwd")` was
+  denied while `import("file:///etc/passwd", {with: {type: "json"}})` returned the
+  parsed file — a documented control that did nothing. The module loader now
+  checks a dynamic `file:` import against read permissions and a dynamic
+  non-`file:` import against `allow_import`/`deny_import`. The module named by
+  `:main_module_path` and its static import graph remain exempt: they are
+  operator-supplied and loaded once at bootstrap, which is the same
+  static-versus-dynamic specifier distinction Deno makes internally.
+- **`:apply` authorization trusted a guest-writable runtime id.** `op_apply` read
+  the id from `Tyrex._runtimeId` on the JS global, so guest code could name
+  another runtime and have that runtime's allowlist authorize the call. The id
+  now lives in per-runtime `OpState`, unreachable from JavaScript, and
+  `Tyrex._runtimeId` is gone.
+- **Runaway programs leaked a 100%-CPU OS thread for the life of the VM.**
+  `stop/1` returning `:ok` was not evidence of reclamation: it killed the Elixir
+  process while the per-runtime thread kept spinning. Measured at 299.6% CPU
+  with three runaways after every runtime was stopped and every Elixir process
+  was dead. Because this is not a dirty scheduler, the leak was uncapped by
+  `dirty_cpu_schedulers` and invisible to BEAM scheduler-utilization
+  monitoring. The runtime resource now terminates the isolate on drop, so the
+  thread is reclaimed even on a brutal kill. Covered by a regression test that
+  asserts CPU returns to baseline.
+- **The near-heap-limit callback could outlive the state it pointed into.** The
+  `Arc` holding the callback state was declared after the worker, so on
+  `worker::new`'s error paths it was freed while the isolate still held a raw
+  pointer into it. The hand-rolled callback is replaced by
+  `JsRuntime::add_near_heap_limit_callback`, which owns the boxed closure in a
+  field declared to outlive the isolate — no raw pointer, no `unsafe`, and no
+  drop-order invariant for the next refactor to break silently.
+- **A small `:max_heap_mb` aborted the entire BEAM at `Tyrex.start/1`** — exactly
+  what the option exists to prevent. The callback cannot be armed before the
+  isolate exists, so Deno's bootstrap and snapshot deserialization, the heaviest
+  allocation phase in a runtime's life, always run under V8's default `abort()`.
+  Measured on arm64 macOS with V8 146.4.0: 13 MB aborts inside bootstrap, 14 MB
+  boots reliably. `:max_heap_mb` now has a floor of 32 MB — roughly 2.3x the
+  measured minimum, because the failure mode is loss of the whole node — and
+  smaller values are rejected with a message naming both numbers.
+- Panics on the worker thread no longer leak a runtime slot and hang callers.
+  The worker runs on a bare `std::thread::spawn`, outside rustler's
+  `catch_unwind`, so a panic — `serde_v8` unwrapping an empty `MaybeLocal` under
+  a pending termination, for instance — skipped both the slab removal and the
+  drain of pending promises. The worker body is now wrapped in `catch_unwind` so
+  that cleanup runs either way. This release made termination asynchronous and
+  arbitrary, where it was previously observed only between operations.
+- **`blocking: true` deadlocked permanently against the bridge.** `handle_call`
+  parked in the NIF while `op_apply` needed that same GenServer; the call timed
+  out and the runtime was then unusable forever. The blocking receive is now
+  bounded and the combination is refused outright.
+- **Permission parsing failed open.** Malformed JSON or an unexpected shape fell
+  back to `PermissionsContainer::allow_all` while reporting success. It now
+  returns an error and the runtime refuses to start.
+- **`allow_x: false` was inverted under `allow_all: true`.** The explicit denial
+  parsed to `None` and was then swallowed by the `allow_all` default, re-granting
+  unrestricted access.
+- **`allow_read: []` granted the whole filesystem.** An empty allowlist now
+  grants nothing, matching what it reads like.
+- **`false` was documented as "deny all" for all sixteen permission keys.** True
+  for the eight `allow_*` keys, inverted for the eight `deny_*`, where
+  `deny_read: false` denies nothing and the read succeeds. The docs now split by
+  direction: `false` is the absence of a rule in whichever direction the key
+  names, and an empty list allows nothing but denies nothing.
+- Unknown permission keys were silently dropped, so `[deny_nett: true]` yielded
+  a permissive runtime reporting success. They now raise `ArgumentError`, as do
+  non-string list entries and malformed values.
+- Non-string entries in a permission list were silently filtered out, quietly
+  widening the grant.
+- `apply_reply` matched only `{:ok, {}}`, so a dead worker raised a `MatchError`
+  and took the GenServer down with an unhelpful reason.
+- An allowlisted Elixir function that raises now rejects the JavaScript promise
+  instead of destroying the runtime.
+- The blocking-eval path replied before stopping on a dead runtime; it
+  previously stopped without replying, leaving the caller blocked until its own
+  call timeout.
+- The GenServer now tracks in-flight requests, so a timeout can be attributed to
+  the request that caused it and every other in-flight caller is told the
+  runtime died under it.
+- `native/tyrex/.cargo/config.toml` is now packaged. It was missing from
+  `mix.exs` `package.files` while the README sends Alpine/musl and NixOS users
+  to a source build, so the documented install path was broken from Hex.
+- The crate now enables rustler's `nif_version_2_16` feature, so the binaries
+  match the `nif-2.16` label they have carried since v0.3.0. rustler removed
+  env-var NIF selection in 0.30 — it is a Cargo feature now, and `rustler-0.38.0`
+  defaults to `nif_version_2_15` — so `rustler = "=0.38.0"` with no `features`
+  compiled against 2.15 while every artifact name said 2.16.
+  `RUSTLER_NIF_VERSION` was inert everywhere it appeared, including in
+  `release.yml`; that plumbing is deleted rather than kept and described as a fix.
+- Releases are now all-or-nothing. Each matrix leg published its own archive
+  with `if: always()` and `fail-fast: false`, so three of four targets could
+  ship against a four-entry checksum file.
+
+### Security scope
+
+Bridge-off-by-default, a permission-checked module loader, a real kill, and a
+heap cap close the known holes. The one deliberate exemption is the module named
+by `:main_module_path` and its static imports, which load regardless of
+`:permissions` because they are operator-supplied. None of this makes tyrex an
+audited sandbox boundary: the runtime is in-process, so a V8 escape is a BEAM
+compromise. For a hard boundary against untrusted code, run Deno out of process.
+
 ## v0.3.0 (2026-05-23)
 
 ### Added

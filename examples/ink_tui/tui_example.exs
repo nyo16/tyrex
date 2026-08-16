@@ -4,7 +4,7 @@
 
 IO.puts("=== Tyrex Ink TUI Example ===\n")
 
-{:ok, pid} = Tyrex.start(main_module_path: "examples/ink_tui/tui.js")
+{:ok, pid} = Tyrex.start(permissions: :none, main_module_path: "examples/ink_tui/tui.js")
 
 # Status Dashboard
 services =

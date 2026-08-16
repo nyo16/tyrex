@@ -3,7 +3,16 @@ deno_core = "0.391.0"
 deno_fs = "0.148.0"
 deno_resolver = "0.69.0"
 deno_runtime = { version = "0.246.0", features = ["transpile"] }
-rustler = "0.36.0"
+# Pinned with `=` so it cannot drift from the Elixir-side `:rustler` dep again.
+# rustler's own version guard has zero callers, so drift is otherwise silent.
+#
+# `nif_version_2_16` is not optional decoration: rustler removed env-var NIF
+# selection in 0.30, and 0.38.0 declares `default = ["nif_version_2_15"]`. With
+# no features requested we compiled 2.15 while labelling every published archive
+# `nif-2.16`. This feature is the only thing that makes that label true, and it
+# must stay in step with `nif_versions:` in `lib/tyrex/native.ex` and the
+# `NIF_VERSION` label in `.github/workflows/release.yml`.
+rustler = { version = "=0.38.0", features = ["nif_version_2_16"] }
 serde = "1.0"
 serde_json = "1.0"
 serde_v8 = "0.300.0"
@@ -27,4 +36,4 @@ path = "src/lib.rs"
 [package]
 edition = "2021"
 name = "tyrex"
-version = "0.3.0"
+version = "0.4.0"

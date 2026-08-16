@@ -3,8 +3,22 @@
 
 IO.puts("=== Tyrex Basic Examples ===\n")
 
-# Start a single runtime
-{:ok, pid} = Tyrex.start()
+# Start a single runtime.
+#
+# `:permissions` is passed explicitly because as of v0.4.0 the default is
+# `:none` and omitting it logs a one-time upgrade warning. `:none` is all this
+# example needs — nothing here touches the filesystem, network or env.
+#
+# `:apply` is what lets the JavaScript further down call back into Elixir. It is
+# off by default and allowlisted per `{Module, :function, arity}`: only these two
+# MFAs are reachable, and anything else is refused. Without it the two
+# `Tyrex.apply` calls at the bottom reject, because `globalThis.Tyrex` is
+# deleted after bootstrap when the bridge is off.
+{:ok, pid} =
+  Tyrex.start(
+    permissions: :none,
+    apply: [{Enum, :sum, 1}, {Enum, :reverse, 1}]
+  )
 
 # Simple arithmetic
 {:ok, result} = Tyrex.eval("1 + 2", pid: pid)
@@ -60,6 +74,15 @@ IO.puts("Enum.sum from JS: #{result}")
   )
 
 IO.puts("Enum.reverse from JS: #{inspect(result)}")
+
+# Anything NOT on the allowlist is refused, whatever the guest asks for.
+{:error, %Tyrex.Error{name: :promise_rejection, value: denied}} =
+  Tyrex.eval(
+    ~s|(async () => await Tyrex.apply("File", "read!", ["mix.exs"]))()|,
+    pid: pid
+  )
+
+IO.puts("Non-allowlisted call refused: #{denied}")
 
 Tyrex.stop(pid: pid)
 IO.puts("\n=== Done! ===")

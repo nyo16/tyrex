@@ -2,8 +2,8 @@
 #
 # Compares throughput of a single runtime vs a pool under concurrent load.
 
-{:ok, single} = Tyrex.start()
-{:ok, _} = Tyrex.Pool.start_link(name: :conc_pool, size: System.schedulers_online())
+{:ok, single} = Tyrex.start(permissions: :none)
+{:ok, _} = Tyrex.Pool.start_link(name: :conc_pool, size: System.schedulers_online(), permissions: :none)
 
 code = "[1,2,3,4,5].reduce((a, b) => a + b, 0)"
 

@@ -5,6 +5,9 @@ rustler::atoms! {
     eval_reply,
     error,
     execution_error,
+    heap_limit_error,
     promise_rejection,
+    timeout,
+    worker_panicked,
     ok,
 }

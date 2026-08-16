@@ -10,7 +10,15 @@ defmodule Tyrex.Error do
       * `:conversion_error` — A value could not be converted between Elixir
         and JavaScript representations
       * `:dead_runtime_error` — The underlying runtime is no longer alive
-        (e.g. crashed or was stopped while a call was in flight)
+        (e.g. crashed, was killed, or was stopped while a call was in flight)
+      * `:timeout` — An `eval` exceeded its `:timeout` deadline. The V8 isolate
+        was terminated, so the runtime is dead and must be replaced
+      * `:heap_limit_error` — The guest exceeded the runtime's `:max_heap_mb`
+        cap. The isolate was terminated, so the runtime is dead
+      * `:unsupported_option` — The requested combination of options cannot be
+        served. Two producers: `blocking: true` on a runtime with the `:apply`
+        bridge enabled, which would deadlock, and `timeout: :infinity` on either
+        eval path, which would arm no deadline at all
     * `:message` - Human-readable error message (optional)
     * `:value` - Additional error value, such as the rejected promise value (optional)
   """
