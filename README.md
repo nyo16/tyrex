@@ -234,7 +234,7 @@ Tyrex.start(permissions: [
 | `allow_run` | `deny_run` | Subprocess execution (`Deno.Command`) |
 | `allow_ffi` | `deny_ffi` | Foreign function interface |
 | `allow_sys` | `deny_sys` | System info (hostname, OS, memory, etc.) |
-| `allow_import` | `deny_import` | Dynamic ES module imports of non-`file:` specifiers (`https:` and friends) |
+| `allow_import` | `deny_import` | Non-`file:` module specifiers. Deny-only in practice — see below |
 
 ### Dynamic `import()` vs. the main module
 
@@ -247,6 +247,7 @@ initiate:
   the same import of `/tmp/x` succeeds.
 - A dynamic `import()` of a non-`file:` specifier is checked against
   `allow_import` / `deny_import`, so `deny_import: true` blocks `https:` imports.
+  **`allow_import` cannot make one succeed**, though — see the note below.
 - The module named by `:main_module_path` and its static import graph are exempt.
   They are operator-supplied and loaded once at bootstrap, so
   `Tyrex.start(permissions: :none, main_module_path: "priv/js/app.js")` starts
@@ -264,6 +265,28 @@ under any permission set: `permissions: :none` denied
 `Deno.readTextFileSync("/etc/passwd")` while
 `import("file:///etc/passwd", {with: {type: "json"}})` returned the parsed file,
 and `deny_import` was inert.
+
+> #### `allow_import` grants nothing {: .warning}
+>
+> Remote module loading is **not supported at all**. Tyrex's module loader wraps
+> `deno_core::FsModuleLoader`, which only reads `file:` URLs, so every non-`file:`
+> specifier fails at load time regardless of permissions:
+>
+> ```
+> permissions: :allow_all                              -> not a file URL
+> permissions: [allow_import: true, allow_net: true]   -> not a file URL
+> permissions: [allow_all: true, deny_import: true]    -> Requires import access to "deno.land:443"
+> ```
+>
+> So the pair is asymmetric. `deny_import` is live and does something useful — it
+> moves the failure from a confusing `"is not a file URL"` into an explicit
+> permission denial, which is what you want in a log. `allow_import` is
+> effectively decorative: granting it changes nothing, because the loader never
+> gets as far as consulting it. `data:` and `blob:` specifiers are exempted by
+> Deno's own check but die in the loader too, so no grant leaks either way.
+>
+> If you need a remote dependency, vendor it to disk and import the `file:` path,
+> or bundle it into `:main_module_path`.
 
 ### Fail-Closed Parsing
 
@@ -708,11 +731,19 @@ Tyrex ships precompiled NIFs for these platforms — no Rust toolchain needed:
 | Linux x86_64 (glibc) | `x86_64-unknown-linux-gnu` |
 | Linux ARM64 (glibc) | `aarch64-unknown-linux-gnu` |
 
-Precompiled binaries require **OTP 27+** (NIF version 2.16), which is what the
-`nif-2.16` in each archive name refers to. The NIF level is selected by the
-`nif_version_2_16` Cargo feature on the crate's `rustler` dependency — rustler
-removed environment-variable selection in 0.30, so `RUSTLER_NIF_VERSION` has had
-no effect since then and setting it changes nothing.
+Precompiled binaries are built against **NIF 2.16**, which is what the `nif-2.16`
+in each archive name refers to. NIF 2.16 is the erl_nif API level shipped with
+**OTP 24**, so that — not OTP 27 — is the floor the BEAM enforces when it loads
+the library: `rustler-0.38.0` maps `nif_version_2_16` to `min_erts = "OTP-24.0"`,
+and that string is present in the built artifact
+(`strings -a libtyrex.dylib | grep -x OTP-24.0`).
+
+In practice the binding's own floor is the higher one: `mix.exs` requires
+`elixir: "~> 1.18"`, which needs **OTP 25+**. Use that as the supported minimum.
+
+The NIF level is selected by the `nif_version_2_16` Cargo feature on the crate's
+`rustler` dependency — rustler removed environment-variable selection in 0.30, so
+`RUSTLER_NIF_VERSION` has had no effect since then and setting it changes nothing.
 
 ### Platforms requiring source build
 

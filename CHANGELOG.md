@@ -37,8 +37,11 @@ rejected at start rather than at first call.
 - `:timeout` on `eval/2` is now a real wall-clock deadline. It was previously
   only a `GenServer.call/3` timeout: the caller gave up and the JavaScript kept
   running. On expiry the V8 isolate is terminated and `{:error,
-  %Tyrex.Error{name: :timeout}}` is returned. The `GenServer.call` timeout is
-  now the deadline plus a 1s grace so the server always wins the race.
+  %Tyrex.Error{name: :timeout}}` is returned. The `GenServer.call` timeout is the
+  deadline plus a 1s grace, which covers scheduler jitter — but not GenServer
+  *occupancy*: `arm_deadline/3` runs inside `handle_call`, so a caller queued
+  behind a blocking eval has no deadline armed while its own call timeout runs
+  out, and still exits `:timeout` rather than receiving an error tuple.
 - Termination is a one-way door: a runtime that hits its deadline or heap cap
   is dead and is replaced, never reused. V8 termination is uncatchable and
   sticky, so a "recovered" isolate would be a silent brick.
@@ -48,8 +51,10 @@ rejected at start rather than at first call.
   which is I/O-shaped waiting, not compute.
 - `blocking: true` is now refused with `:unsupported_option` when the `:apply`
   bridge is enabled, or when `:timeout` is `:infinity`.
-- Aligned the rustler pair: Elixir `~> 0.38.0` and the Rust crate `=0.38.0`,
-  pinned so the drift cannot silently recur.
+- Aligned the rustler pair: Elixir `~> 0.38.0` and the Rust crate `=0.38.0`, the
+  latter pinned with `=` and carrying the `nif_version_2_16` feature. Note only
+  those are pinned: the `NIF_VERSION` label in the release workflow and the
+  `nif_versions:` list in `lib/tyrex/native.ex` are kept in agreement by hand.
 
 ### Added
 

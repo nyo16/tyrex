@@ -55,6 +55,14 @@ defmodule Tyrex do
   **terminated and dead**. V8 termination is uncatchable and sticky, so tyrex
   does not attempt to nurse a poisoned isolate back to health; under a
   supervisor the child is simply replaced.
+
+  Replacement is not free, and guest code chooses how often it happens. Under a
+  `Tyrex.Pool` the runtimes are supervised `:one_for_one`, so one guest's
+  deadline does not disturb its siblings — but the caller whose runtime died
+  still has to retry, a call arriving during the restart window gets
+  `{:error, %Tyrex.Error{name: :dead_runtime_error}}`, and the pool's
+  `:max_restarts` / `:max_seconds` ceiling still applies. Tune those if untrusted
+  guests are expected to trip deadlines routinely; see `Tyrex.Pool.start_link/1`.
   """
 
   use GenServer
@@ -184,9 +192,14 @@ defmodule Tyrex do
     * `:allow_ffi` / `:deny_ffi` — Foreign function interface
     * `:allow_sys` / `:deny_sys` — System info (hostname, OS, etc.)
     * `:allow_import` / `:deny_import` — Dynamic `import()` of non-`file:`
-      specifiers. A dynamic `import()` of a `file:` specifier is governed by the
-      read permissions above instead; the main module and its static import
-      graph are operator-supplied and exempt from both.
+      specifiers. **Deny-only in practice:** the module loader reads `file:` URLs
+      only, so a remote import fails regardless of permissions and
+      `allow_import` cannot make one succeed. `deny_import: true` is still
+      worthwhile — it turns a confusing "is not a file URL" into an explicit
+      permission denial. A dynamic `import()` of a `file:` specifier is governed
+      by the read permissions above instead; the main module and its static
+      import graph are operator-supplied and exempt from both. Vendor remote
+      dependencies to disk if you need them.
 
   Parsing fails closed. An unknown key raises `ArgumentError` rather than being
   silently dropped, an empty `allow_x` list grants nothing rather than
