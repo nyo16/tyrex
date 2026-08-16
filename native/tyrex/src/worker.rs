@@ -332,20 +332,19 @@ fn build_permissions(
     // `matches!(..., True)` — fail-closed, so never a hole, but the one place in
     // this parser that silently reinterpreted a shape it was handed. That is
     // exactly what the comment above `PERMISSION_KEYS` refuses to do.
-    let allow_all = match obj.get("allow_all") {
-        Some(value) => match parse_perm_value("allow_all", value)? {
-            PermValue::True => true,
-            PermValue::False => false,
-            PermValue::List(_) => {
-                return Err(permissions_error(
+    let allow_all =
+        match obj.get("allow_all") {
+            Some(value) => match parse_perm_value("allow_all", value)? {
+                PermValue::True => true,
+                PermValue::False => false,
+                PermValue::List(_) => return Err(permissions_error(
                     "permission allow_all must be true or false, not a list — it is a baseline \
                      for every other key, so a list of paths or hosts has no meaning here"
                         .to_string(),
-                ))
-            }
-        },
-        None => false,
-    };
+                )),
+            },
+            None => false,
+        };
 
     // `allow_all: true` is a baseline that explicit keys override in BOTH
     // directions. Previously an explicit `allow_X: false` parsed to `None` and
@@ -544,9 +543,8 @@ pub async fn new(
         let tripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&tripped);
         let handle = isolate_handle.clone();
-        worker
-            .js_runtime
-            .add_near_heap_limit_callback(move |current_heap_limit, _initial_heap_limit| {
+        worker.js_runtime.add_near_heap_limit_callback(
+            move |current_heap_limit, _initial_heap_limit| {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 handle.terminate_execution();
                 // Raising the limit is what lets V8 unwind rather than abort, and
@@ -565,7 +563,8 @@ pub async fn new(
                 // memory". The ratchet is bounded by terminate-means-dead: the
                 // runtime is already dead, so growth is bounded in wall-clock.
                 current_heap_limit + HEAP_LIMIT_SLACK_BYTES
-            });
+            },
+        );
         tripped
     });
 
@@ -679,8 +678,8 @@ fn termination_error(
     worker: &mut MainWorker,
     heap_limit_tripped: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Error> {
-    let tripped_heap_limit = heap_limit_tripped
-        .is_some_and(|tripped| tripped.load(std::sync::atomic::Ordering::SeqCst));
+    let tripped_heap_limit =
+        heap_limit_tripped.is_some_and(|tripped| tripped.load(std::sync::atomic::Ordering::SeqCst));
 
     if tripped_heap_limit {
         Some(Error {
