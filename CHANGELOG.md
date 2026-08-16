@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.0 (2026-08-14)
+## v0.4.0 (2026-08-16)
 
 Security and lifecycle release. Two independent reviews — an internal audit and
 a downstream integrator reading the same commit — found the same two defects:
