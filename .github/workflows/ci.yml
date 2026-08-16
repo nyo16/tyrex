@@ -117,11 +117,12 @@ jobs:
             echo "LIBCLANG_PATH=/usr/lib/llvm-20/lib" >> $GITHUB_ENV
           fi
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v2-ci
-          workspaces: |
-            native/tyrex
+      # No Swatinem/rust-cache — see the long comment in release.yml. Same crate,
+      # same rusty_v8 build script, same failure mode: a restored cache replays a
+      # stale `-L` into a pruned OUT_DIR and the build dies with
+      # `could not find native static library rusty_v8`. This job has not hit it
+      # yet only because its first two runs failed before saving a cache, so the
+      # trap was never armed.
 
       - uses: erlef/setup-beam@v1
         with:

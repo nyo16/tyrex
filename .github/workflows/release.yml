@@ -243,12 +243,25 @@ jobs:
 
       # --- Common build steps ---
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v3-precomp
-          shared-key: ${{ matrix.target }}-${{ env.NIF_VERSION }}
-          workspaces: |
-            native/tyrex
+      # Deliberately NOT using Swatinem/rust-cache here. It is unsafe for this
+      # crate, and the failure is silent-then-fatal rather than slow:
+      #
+      # rusty_v8's build script reads RUSTY_V8_ARCHIVE (an out-of-tree file under
+      # /tmp) and emits a `-L` search path into its own OUT_DIR under target/.
+      # rust-cache preserves the build-script *fingerprint* but prunes that
+      # OUT_DIR, so on any run that restores a cache, cargo decides `v8` is
+      # up to date, replays the stale `-L`, and fails with
+      # `could not find native static library rusty_v8`.
+      #
+      # Observed exactly that on this workflow: the first run had no cache, built
+      # `v8` in 12m and passed; the next run restored a full-match cache,
+      # "compiled" `v8` in 2 seconds and died. It arms itself after the first
+      # green run, which means it would have broken the tag build.
+      #
+      # The expensive artifact — librusty_v8.a, 1-2h to build — is cached
+      # separately by actions/cache above and is unaffected. What this costs is
+      # ~12 minutes of crate compilation per leg, in parallel, on a workflow that
+      # runs on tags. That is the right trade for a release build that works.
 
       - name: Build the NIF
         shell: bash
