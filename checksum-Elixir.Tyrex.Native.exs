@@ -1,6 +1,6 @@
 %{
-  "libtyrex-v0.3.0-nif-2.16-aarch64-apple-darwin.so.tar.gz" => "sha256:e7b99d17e1c1e2309266128871715c897173539c56e178af0dcf1179dd68201f",
-  "libtyrex-v0.3.0-nif-2.16-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:47ad45ae48bc61f2758f197bb69b1bb89ff673d2b1e87b66561a82b25c1abb68",
-  "libtyrex-v0.3.0-nif-2.16-x86_64-apple-darwin.so.tar.gz" => "sha256:263e7ca7fe3a7a1d4ec68e306a97e58b165fd7e07fb5a78b009f591993edd976",
-  "libtyrex-v0.3.0-nif-2.16-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:7635c4efd15fd158c28b618dad3d2488a1cc4a1464c3bddd663ed7185e0c8fb8",
+  "libtyrex-v0.4.0-nif-2.16-aarch64-apple-darwin.so.tar.gz" => "sha256:f8c12acbb39fc919ac74cfc1c831a37644fcf0a1d42b14be0fb877cd242e173f",
+  "libtyrex-v0.4.0-nif-2.16-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:1e7b3be414724b5de108b5d2dea53a595db02bf0c6cc92f06831870f4dd69d36",
+  "libtyrex-v0.4.0-nif-2.16-x86_64-apple-darwin.so.tar.gz" => "sha256:57147acbad95fafa8ed9a4c311bf5dae2f9af8570f83f3c8717bd31abb838820",
+  "libtyrex-v0.4.0-nif-2.16-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:0b17368f22d7160efa00392d827b0c9e4dcf551431319401bd2298f75f6a3cf3",
 }
